@@ -1,0 +1,17 @@
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.29,<1.0
+pymupdf4llm>=0.0.17,<1.0
+pymupdf>=1.24,<2.0
+pytesseract>=0.3.10,<1.0
+Pillow>=10.0,<12.0
+spacy>=3.7,<4.0
+langchain>=0.2,<1.0
+langchain-community>=0.2,<1.0
+langchain-core>=0.2,<1.0
+numpy>=1.26,<3.0
+pydantic>=2.0,<3.0
+qdrant-client>=1.9,<2.0
+sentence-transformers>=3.0,<4.0
+tqdm>=4.66,<5.0
+python-dotenv>=1.0,<2.0
+faiss-cpu>=1.8,<2.0
