@@ -326,32 +326,38 @@ def inject_chat_fab() -> None:
             st.session_state.setdefault("chat_history", []).append(
                 {"role": "user", "content": question}
             )
-            full_answer = ""
             sources = []
-            try:
-                with httpx.stream(
-                    "POST",
-                    f"{BACKEND_URL}/chat",
-                    json={
-                        "doc_id": doc_id,
-                        "question": question,
-                        "history": st.session_state["chat_history"][:-1],
-                        "chunks": [],
-                    },
-                    timeout=300,
-                ) as r:
-                    streamed = ""
-                    for line in r.iter_lines():
-                        if line.startswith("data: "):
-                            data = _json.loads(line[6:])
-                            if not data.get("done"):
-                                streamed += data.get("token", "")
-                            else:
-                                sources = data.get("sources", [])
-                    full_answer = streamed
-            except httpx.ConnectError:
-                full_answer = f"[Cannot reach backend at {BACKEND_URL}]"
+            streamed = ""
+            with chat_container:
+                st.chat_message("user").write(question)
+                with st.chat_message("assistant"):
+                    response_placeholder = st.empty()
+                    try:
+                        with httpx.stream(
+                            "POST",
+                            f"{BACKEND_URL}/chat",
+                            json={
+                                "doc_id": doc_id,
+                                "question": question,
+                                "history": st.session_state["chat_history"][:-1],
+                                "chunks": [],
+                            },
+                            timeout=300,
+                        ) as r:
+                            for line in r.iter_lines():
+                                if line.startswith("data: "):
+                                    data = _json.loads(line[6:])
+                                    if not data.get("done"):
+                                        streamed += data.get("token", "")
+                                        response_placeholder.markdown(streamed + "▌")
+                                    elif "sources" in data:
+                                        sources = data["sources"]
+                        response_placeholder.markdown(streamed)
+                    except httpx.ConnectError:
+                        streamed = f"[Cannot reach backend at {BACKEND_URL}]"
+                        response_placeholder.markdown(streamed)
 
+            full_answer = streamed
             if sources:
                 full_answer += "\n\n**Sources:** " + ", ".join(sources)
 

@@ -9,12 +9,14 @@ import threading
 import time
 import uuid
 import warnings
+from collections import namedtuple
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 from pathlib import Path
 
 from dotenv import load_dotenv
+
 load_dotenv(Path(__file__).parent / ".env")
 
 import fitz  # pymupdf
@@ -45,6 +47,11 @@ from backend.text_utils import (
     strip_page_numbers,
 )
 
+IndexBundle = namedtuple(
+    "IndexBundle", ["faiss_index", "para_keys", "bm25", "tokenized"]
+)
+
+
 async def _warmup(loop: asyncio.AbstractEventLoop) -> None:
     await asyncio.gather(
         loop.run_in_executor(None, get_cross_encoder),
@@ -54,11 +61,13 @@ async def _warmup(loop: asyncio.AbstractEventLoop) -> None:
         get_rhet_chain_async(),
     )
 
+
 @asynccontextmanager
 async def lifespan(app):
     loop = asyncio.get_running_loop()
     asyncio.create_task(_warmup(loop))
     yield
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -71,59 +80,64 @@ app.add_middleware(
 
 # ── Model configs ──────────────────────────────────────────────────────────────
 # Override any model via env var: RHET_MODEL, RAG_LLM_MODEL, EMBED_MODEL
-_RHET_OLLAMA_MODEL   = os.getenv("RHET_MODEL",        "deepseek-v3.1:671b-cloud")
-_RAG_LLM_MODEL       = os.getenv("RAG_LLM_MODEL",     "gpt-oss:120b-cloud")
-_RAG_EMBED_MODEL     = os.getenv("EMBED_MODEL",        "bge-m3")
-_SIMILAR_EMBED_MODEL = os.getenv("EMBED_MODEL",        "bge-m3")  # 1024-dim; used for /similar and ingest
-_SIMILAR_EMBED_DIM   = 1024
-_QDRANT_COLLECTION   = "indian_judgements"
-_CHUNK_LLM_MODEL     = os.getenv("CHUNK_LLM_MODEL",   _RHET_OLLAMA_MODEL)
+_RHET_OLLAMA_MODEL = os.getenv("RHET_MODEL", "deepseek-v3.1:671b-cloud")
+_RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "gpt-oss:120b-cloud")
+_RAG_EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
+_SIMILAR_EMBED_MODEL = os.getenv(
+    "EMBED_MODEL", "bge-m3"
+)  # 1024-dim; used for /similar and ingest
+_SIMILAR_EMBED_DIM = 1024
+_QDRANT_COLLECTION = "indian_judgements"
+_CHUNK_LLM_MODEL = os.getenv("CHUNK_LLM_MODEL", _RHET_OLLAMA_MODEL)
+_EMBED_BATCH = 16
 
 # ── Page-number line detection ─────────────────────────────────────────────────
 
 # ── Footer metadata patterns ───────────────────────────────────────────────────
 _FOOTER_JUDGE_NAME_RE = re.compile(
-    r'^[\[(]([A-Za-z][^\]\)\n]{1,80})[\])]\s*$',
+    r"^[\[(]([A-Za-z][^\]\)\n]{1,80})[\])]\s*$",
 )
 _JUDGMENT_DATE_RE = re.compile(
-    r'\b(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST'
-    r'|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)'
-    r'\s+(?:\d{1,2},\s*)?\d{4}\b',
+    r"\b(JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST"
+    r"|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER)"
+    r"\s+(?:\d{1,2},\s*)?\d{4}\b",
     re.IGNORECASE,
 )
 _JUDGMENT_LOCATION_RE = re.compile(
-    r'\b(NEW\s+DELHI|MUMBAI|CHENNAI|KOLKATA|HYDERABAD|BENGALURU|BANGALORE)\b',
+    r"\b(NEW\s+DELHI|MUMBAI|CHENNAI|KOLKATA|HYDERABAD|BENGALURU|BANGALORE)\b",
     re.IGNORECASE,
 )
 
 # ── Para-body line-joining helpers ─────────────────────────────────────────────
-_SENT_END_RE = re.compile(r'[.;:—–!?]\*{0,4}\s*$')
+_SENT_END_RE = re.compile(r"[.;:—–!?]\*{0,4}\s*$")
 _STRUCT_NEXT_RE = re.compile(
-    r'^\|'                          # table rows — never merge into preceding line
-    r'|^>|^[-*+]\s'
-    r'|^\(([a-z]|[ivx]+|\d)\)'
-    r'|^\d+\.\d'
-    r'|^#{1,4}\s'
-    r'|^\*\*[A-Z]'
+    r"^\|"  # table rows — never merge into preceding line
+    r"|^>|^[-*+]\s"
+    r"|^\(([a-z]|[ivx]+|\d)\)"
+    r"|^\d+\.\d"
+    r"|^#{1,4}\s"
+    r"|^\*\*[A-Z]"
 )
 _PAGE_OR_SIG = re.compile(
-    r'^\s*(?:Page\s+\d+\s+of\s+\d+|\d+\s*/\s*\d+|\d{1,3})\s*$',
+    r"^\s*(?:Page\s+\d+\s+of\s+\d+|\d+\s*/\s*\d+|\d{1,3})\s*$",
     re.IGNORECASE,
 )
 
 # ── Shared LCEL post-processing steps ─────────────────────────────────────────
 # Strips <think>…</think> reasoning blocks emitted by some local models (e.g. DeepSeek-R1).
 _STRIP_THINK = RunnableLambda(
-    lambda t: re.sub(r'<think>.*?</think>', '', t, flags=re.DOTALL).strip()
+    lambda t: re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL).strip()
 )
 # Strips markdown code fences (```json … ```) that models sometimes wrap output in.
 _STRIP_FENCES = RunnableLambda(
-    lambda t: re.sub(r'^```[a-z]*\s*|\s*```$', '', t.strip(), flags=re.MULTILINE).strip()
+    lambda t: re.sub(
+        r"^```[a-z]*\s*|\s*```$", "", t.strip(), flags=re.MULTILINE
+    ).strip()
 )
 
 # ── Judge-line detection for implicit-para-1 ───────────────────────────────────
 _JUDGE_LINE_RE = re.compile(
-    r'^[A-Z][A-Z\s.,]+J\.$|\*\*[A-Z\s.,]+J\.\*\*',
+    r"^[A-Z][A-Z\s.,]+J\.$|\*\*[A-Z\s.,]+J\.\*\*",
     re.MULTILINE,
 )
 
@@ -131,47 +145,66 @@ _JUDGE_LINE_RE = re.compile(
 # Matches either:
 #   JUDGEMENT/JUDGMENT  (then a judge-name line with J./CJI.)
 #   ORDER               (standalone — no following judge name required)
-_JUDGE_SUFFIX = r'(?:J\.|CJI\.?|,\s*J)'   # matches "J.", "CJI", "CJI.", ", J"
+_JUDGE_SUFFIX = r"(?:J\.|CJI\.?|,\s*J)"  # matches "J.", "CJI", "CJI.", ", J"
 
 _UPPER_META_END_RE = re.compile(
-    r'(?:'
-    r'\bJUDG[EE]?MENT\b[^\n]*\n(?:[^\S\n]*\n)*[^\n]*' + _JUDGE_SUFFIX + r'[^\n]*'  # JUDGEMENT + judge
-    r'|'
-    r'^\*{0,2}\s*ORDER\s*\*{0,2}\s*$'                                                # standalone ORDER line
-    r')',
+    r"(?:"
+    r"\bJUDG[EE]?MENT\b[^\n]*\n(?:[^\S\n]*\n)*[^\n]*"
+    + _JUDGE_SUFFIX
+    + r"[^\n]*"  # JUDGEMENT + judge
+    r"|"
+    r"^\*{0,2}\s*ORDER\s*\*{0,2}\s*$"  # standalone ORDER line
+    r")",
     re.IGNORECASE | re.MULTILINE,
 )
 
 # Captures the authoring judge name line that follows a JUDGEMENT/JUDGMENT heading.
 _AUTHORING_JUDGE_RE = re.compile(
-    r'\bJUDG[EE]?MENT\b[^\n]*\n(?:[^\S\n]*\n)*([^\n]*' + _JUDGE_SUFFIX + r'[^\n]*)',
+    r"\bJUDG[EE]?MENT\b[^\n]*\n(?:[^\S\n]*\n)*([^\n]*" + _JUDGE_SUFFIX + r"[^\n]*)",
     re.IGNORECASE,
 )
 
 # ── NER label config ───────────────────────────────────────────────────────────
 _LEGAL_LABELS: dict[str, str] = {
-    "PROVISION":  "#F0B27A",
-    "STATUTE":    "#F1948A",
-    "PRECEDENT":  "#C39BD3",
+    "PROVISION": "#F0B27A",
+    "STATUTE": "#F1948A",
+    "PRECEDENT": "#C39BD3",
 }
 
 # ── Rhetorical role config ─────────────────────────────────────────────────────
 _LABEL_MAP: dict[str, str] = {
-    "[PREAMBLE]":             "Preamble",
-    "[FACT_ESSENTIAL]":       "Facts",
-    "[FACT_PROCEDURAL]":      "Procedural",
-    "[EVIDENCE_REF]":         "Evidence",
-    "[ISSUE_LEGAL]":          "Issue",
-    "[ARG_PETITIONER]":       "Arg · Petitioner",
-    "[ARG_RESPONDENT]":       "Arg · Respondent",
-    "[PRECEDENT_ANALYSIS]":   "Precedent",
+    "[PREAMBLE]": "Preamble",
+    "[FACT_ESSENTIAL]": "Facts",
+    "[FACT_PROCEDURAL]": "Procedural",
+    "[EVIDENCE_REF]": "Evidence",
+    "[ISSUE_LEGAL]": "Issue",
+    "[ARG_PETITIONER]": "Arg · Petitioner",
+    "[ARG_RESPONDENT]": "Arg · Respondent",
+    "[PRECEDENT_ANALYSIS]": "Precedent",
     "[JUDICIAL_OBSERVATION]": "Observation",
-    "[RATIO_DECIDENDI]":      "Ratio Decidendi",
-    "[DISPOSITION]":          "Disposition",
-    "[DIRECTIVES]":           "Directives",
-    "[COSTS]":                "Costs",
+    "[RATIO_DECIDENDI]": "Ratio Decidendi",
+    "[DISPOSITION]": "Disposition",
+    "[DIRECTIVES]": "Directives",
+    "[COSTS]": "Costs",
 }
 _VALID_ROLES: list[str] = list(_LABEL_MAP.values())
+
+# Maps rhetorical role → IRAC slot label injected into retrieval context
+_ROLE_TO_IRAC: dict[str, str] = {
+    "Preamble": "BACKGROUND",
+    "Facts": "FACTS",
+    "Procedural": "FACTS",
+    "Evidence": "FACTS",
+    "Issue": "ISSUE",
+    "Arg · Petitioner": "APPLICATION",
+    "Arg · Respondent": "APPLICATION",
+    "Observation": "APPLICATION",
+    "Precedent": "RULE",
+    "Ratio Decidendi": "RULE",
+    "Disposition": "CONCLUSION",
+    "Directives": "CONCLUSION",
+    "Costs": "CONCLUSION",
+}
 
 _RHET_SYSTEM = (
     "You are a Senior Legal Document Architect specialising in Indian Supreme Court judgments.\n"
@@ -183,35 +216,46 @@ _RHET_SYSTEM = (
     '{{"para_no":"{para_no}","voice":"<Court|Petitioner|Respondent|Lower Court>",'
     '"role":"<exact role name>","confidence":<0.0-1.0>}}'
 )
-_RHET_CHAT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", _RHET_SYSTEM),
-    ("human",
-     "Para {para_no}:\n"
-     "[PREV] {prev}\n"
-     "[CURR] {curr}\n"
-     "[NEXT] {next}"),
-])
+_RHET_CHAT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", _RHET_SYSTEM),
+        ("human", "Para {para_no}:\n[PREV] {prev}\n[CURR] {curr}\n[NEXT] {next}"),
+    ]
+)
 
 # ── RAG config ─────────────────────────────────────────────────────────────────
 _RAG_SYSTEM = (
-    "You are a legal research assistant. Answer the user's question using ONLY "
-    "the judgment excerpts provided below. Cite relevant paragraphs inline as "
-    "[Para N] (e.g. [Para 12], [Para 47]). You may cite multiple paragraphs. "
-    "If the answer is not present in the excerpts, say so clearly. "
-    "Do not hallucinate facts.\n\n"
-    "JUDGMENT EXCERPTS:\n{context}"
+    "You are a senior Indian Supreme Court legal analyst. "
+    "Answer using ONLY the judgment excerpts below. "
+    "Every factual claim must be cited inline as [Para N].\n\n"
+    "For simple factual questions (identity, date, parties), answer directly and concisely.\n\n"
+    "For legal analysis questions, structure your response as:\n"
+    "**Issue** — the legal question raised\n"
+    "**Rule** — the governing principle or statute\n"
+    "**Application** — how the rule applies to the facts [Para N]\n"
+    "**Conclusion** — the court's holding\n"
+    "**Caveats** — limitations, dissents, or open questions (omit if none)\n\n"
+    "Rules:\n"
+    "• If a section is unsupported by the excerpts, write "
+    "'Not addressed in provided excerpts.'\n"
+    "• Never invent citations, parties, dates, or outcomes.\n"
+    "• If the question cannot be answered from the excerpts, say so clearly "
+    "and do not speculate.\n\n"
+    "JUDGMENT EXCERPTS (each prefixed with its IRAC slot where known):\n{context}"
 )
-_RAG_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", _RAG_SYSTEM),          # {context} filled at invoke time
-    MessagesPlaceholder("history"),    # prior turns as LangChain message objects
-    ("human", "{question}"),
-])
+_RAG_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", _RAG_SYSTEM),  # {context} filled at invoke time
+        MessagesPlaceholder("history"),  # prior turns as LangChain message objects
+        ("human", "{question}"),
+    ]
+)
 
-_BATCH_SIZE          = 8
-_CLASSIFY_WORKERS    = 4
-_CLASSIFY_RETRIES    = 2
+_BATCH_SIZE = 8
+_CLASSIFY_WORKERS = 4
+_CLASSIFY_RETRIES = 2
 _CLASSIFY_CONCURRENCY = int(os.getenv("CLASSIFY_CONCURRENCY", "2"))
-_classify_semaphore  = asyncio.Semaphore(_CLASSIFY_CONCURRENCY)
+_classify_semaphore = asyncio.Semaphore(_CLASSIFY_CONCURRENCY)
 
 # ── Extraction (for /similar and ingest) ───────────────────────────────────────
 
@@ -226,12 +270,12 @@ SYSTEM_PROMPT = (
     "3. outcome: Exactly one of: allowed, dismissed, remanded, affirmed, partly allowed, "
     "quashed, set aside, unknown.\n\n"
     "4. provisions: A list of statutory provisions cited, each as "
-    '{\"text\": \"Section 302 IPC\", \"role\": \"decisive\"}. '
+    '{"text": "Section 302 IPC", "role": "decisive"}. '
     "Role must be one of: decisive, supporting, background, distinguished.\n\n"
     "5. precedents: A list of case citations relied upon, each as "
-    '{\"citation\": \"AIR 1961 SC 1808\", \"short_name\": \"Kehar Singh v State\", \"role\": \"relied_upon\"}. '
+    '{"citation": "AIR 1961 SC 1808", "short_name": "Kehar Singh v State", "role": "relied_upon"}. '
     "Role must be one of: relied_upon, followed, distinguished, overruled, merely_cited.\n\n"
-    "6. statutes: A list of bare statute names cited (e.g. \"Indian Penal Code\", \"CrPC\").\n\n"
+    '6. statutes: A list of bare statute names cited (e.g. "Indian Penal Code", "CrPC").\n\n'
     "Respond with ONLY valid JSON — no markdown fences, no explanation:\n"
     '{"summary": "...", "ratio_decidendi": ["..."], "outcome": "...", '
     '"provisions": [{"text": "...", "role": "..."}], '
@@ -240,10 +284,12 @@ SYSTEM_PROMPT = (
 )
 # SystemMessage (not tuple) prevents ChatPromptTemplate from treating the JSON
 # examples inside SYSTEM_PROMPT as template variables.
-_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
-    SystemMessage(content=SYSTEM_PROMPT),
-    ("human", "{text}"),
-])
+_EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        SystemMessage(content=SYSTEM_PROMPT),
+        ("human", "{text}"),
+    ]
+)
 
 
 class CasedProvision(BaseModel):
@@ -274,7 +320,9 @@ class Extraction(BaseModel):
 
 def _parse_extraction(raw: str) -> Extraction:
     """Parse LLM JSON output → Extraction, with graceful fallback."""
-    clean = re.sub(r'^```[a-z]*\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    clean = re.sub(
+        r"^```[a-z]*\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE
+    ).strip()
     try:
         data = json.loads(clean)
         return Extraction(
@@ -282,12 +330,17 @@ def _parse_extraction(raw: str) -> Extraction:
             ratio_decidendi=[str(r) for r in data.get("ratio_decidendi", [])],
             outcome=str(data.get("outcome", "unknown")),
             provisions=[
-                CasedProvision(**p) for p in data.get("provisions", [])
+                CasedProvision(**p)
+                for p in data.get("provisions", [])
                 if isinstance(p, dict) and "text" in p and "role" in p
             ],
             precedents=[
-                CasedPrecedent(**p) for p in data.get("precedents", [])
-                if isinstance(p, dict) and "citation" in p and "short_name" in p and "role" in p
+                CasedPrecedent(**p)
+                for p in data.get("precedents", [])
+                if isinstance(p, dict)
+                and "citation" in p
+                and "short_name" in p
+                and "role" in p
             ],
             statutes=[str(s) for s in data.get("statutes", [])],
         )
@@ -326,13 +379,51 @@ def _llm_extract(text: str) -> Extraction:
 
 # ── Similarity helpers ─────────────────────────────────────────────────────────
 
-_BM25_STOPWORDS = frozenset({
-    "the", "of", "and", "in", "to", "a", "that", "is", "this", "it",
-    "was", "for", "on", "are", "be", "has", "had", "with", "have",
-    "as", "at", "by", "from", "or", "an", "not", "been", "their",
-    "court", "also", "bench", "matter", "case", "learned", "counsel",
-    "appellant", "respondent", "petitioner", "writ", "appeal", "petition",
-})
+_BM25_STOPWORDS = frozenset(
+    {
+        "the",
+        "of",
+        "and",
+        "in",
+        "to",
+        "a",
+        "that",
+        "is",
+        "this",
+        "it",
+        "was",
+        "for",
+        "on",
+        "are",
+        "be",
+        "has",
+        "had",
+        "with",
+        "have",
+        "as",
+        "at",
+        "by",
+        "from",
+        "or",
+        "an",
+        "not",
+        "been",
+        "their",
+        "court",
+        "also",
+        "bench",
+        "matter",
+        "case",
+        "learned",
+        "counsel",
+        "appellant",
+        "respondent",
+        "petitioner",
+        "writ",
+        "appeal",
+        "petition",
+    }
+)
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -342,7 +433,9 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / union if union else 0.0
 
 
-def _shared_raw(query_canon: set, doc_canon: list[str], doc_raw: list[str]) -> list[str]:
+def _shared_raw(
+    query_canon: set, doc_canon: list[str], doc_raw: list[str]
+) -> list[str]:
     return [doc_raw[i] for i, c in enumerate(doc_canon) if c in query_canon]
 
 
@@ -351,6 +444,7 @@ def _sigmoid(x: float | np.ndarray) -> float | np.ndarray:
 
 
 # ── Singleton model loaders ────────────────────────────────────────────────────
+
 
 @lru_cache(maxsize=1)
 def get_nlp():
@@ -364,6 +458,7 @@ def get_nlp():
 
 _rhet_chain: Any = None
 
+
 async def get_rhet_chain_async():
     global _rhet_chain
     if _rhet_chain is None:
@@ -374,6 +469,7 @@ async def get_rhet_chain_async():
 
 _chunk_llm_local = threading.local()
 
+
 def get_chunk_llm() -> ChatOllama:
     if not hasattr(_chunk_llm_local, "llm"):
         _chunk_llm_local.llm = ChatOllama(model=_CHUNK_LLM_MODEL, temperature=0)
@@ -381,6 +477,7 @@ def get_chunk_llm() -> ChatOllama:
 
 
 _extract_chain_local = threading.local()
+
 
 def _get_extract_chain():
     if not hasattr(_extract_chain_local, "chain"):
@@ -391,6 +488,7 @@ def _get_extract_chain():
 
 
 _rag_chain_local = threading.local()
+
 
 def _get_rag_chain():
     if not hasattr(_rag_chain_local, "chain"):
@@ -403,6 +501,7 @@ def _get_rag_chain():
 @lru_cache(maxsize=1)
 def get_cross_encoder():
     from sentence_transformers import CrossEncoder  # noqa: PLC0415
+
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
@@ -413,6 +512,7 @@ _DOC_STORE_MAX = 20
 @lru_cache(maxsize=1)
 def get_qdrant():
     from qdrant_client import QdrantClient  # noqa: PLC0415
+
     path = os.getenv("QDRANT_PATH")
     if path:
         return QdrantClient(path=path)
@@ -437,8 +537,8 @@ def get_similar_embedder():
 
 
 # ── Server-side document & embedding stores ────────────────────────────────────
-_doc_store: dict[str, dict] = {}       # doc_id → extracted document data
-_embedding_cache: dict[str, tuple] = {}     # doc_id → (faiss_index, para_keys)
+_doc_store: dict[str, dict] = {}  # doc_id → extracted document data
+_embedding_cache: dict[str, IndexBundle] = {}  # doc_id → IndexBundle
 _embed_events: dict[str, asyncio.Event] = {}  # doc_id → Event set when index is ready
 
 
@@ -450,7 +550,11 @@ def _evict_if_needed() -> None:
         _doc_store.pop(oldest_key, None)
         _embedding_cache.pop(oldest_key, None)
         _embed_events.pop(oldest_key, None)
-        logging.info("Evicted doc_store entry %s (cache limit %d reached)", oldest_key, _DOC_STORE_MAX)
+        logging.info(
+            "Evicted doc_store entry %s (cache limit %d reached)",
+            oldest_key,
+            _DOC_STORE_MAX,
+        )
 
 
 # ── Page-number helpers: imported from backend.text_utils ─────────────────────
@@ -458,8 +562,8 @@ def _evict_if_needed() -> None:
 # they are re-exported via the import at the top of this file.
 
 
-
 # ── Paragraph parsing ──────────────────────────────────────────────────────────
+
 
 def para_number(chunk: str, fallback: str = "?") -> str:
     m = re.match(r"\*\*(\d+)\.\*\*|^_?(\d+)\._?\s", chunk)
@@ -468,10 +572,10 @@ def para_number(chunk: str, fallback: str = "?") -> str:
 
 def para_body(chunk: str) -> str:
     body = re.sub(r"^\*\*\d+\.\*\*\s*|^_?\d+\._?\s+", "", chunk, count=1).strip()
-    body = _DIGITAL_SIG_RE.sub('', body)
+    body = _DIGITAL_SIG_RE.sub("", body)
     body = strip_page_numbers(body)
 
-    lines = body.split('\n')
+    lines = body.split("\n")
     merged = []
     i = 0
     while i < len(lines):
@@ -489,31 +593,31 @@ def para_body(chunk: str) -> str:
             and not _PAGE_OR_SIG.match(lines[i + 1])
         ):
             i += 1
-            ln = ln.rstrip() + ' ' + lines[i].strip()
+            ln = ln.rstrip() + " " + lines[i].strip()
         merged.append(ln)
         i += 1
-    return '\n'.join(merged)
+    return "\n".join(merged)
 
 
 def _is_section_heading(line: str) -> bool:
     s = line.strip()
-    cleaned = re.sub(r'^#{1,4}\s*', '', s)
-    cleaned = re.sub(r'^\*{1,2}|\*{1,2}$', '', cleaned).strip()
+    cleaned = re.sub(r"^#{1,4}\s*", "", s)
+    cleaned = re.sub(r"^\*{1,2}|\*{1,2}$", "", cleaned).strip()
     if not cleaned or len(cleaned) > 40:
         return False
     # Parenthesised text is a judge/party name, not a section heading
-    if cleaned.startswith('(') and cleaned.endswith(')'):
+    if cleaned.startswith("(") and cleaned.endswith(")"):
         return False
     # Party names contain ampersands; section headings never do
-    if '&' in cleaned:
+    if "&" in cleaned:
         return False
-    if cleaned.endswith('.'):
+    if cleaned.endswith("."):
         return False
-    if re.match(r'^\d+\.', cleaned):
+    if re.match(r"^\d+\.", cleaned):
         return False
     if _is_page_line(cleaned):
         return False
-    letters = re.sub(r'[^A-Za-z]', '', cleaned)
+    letters = re.sub(r"[^A-Za-z]", "", cleaned)
     if len(letters) < 7:
         return False
     return cleaned == cleaned.upper()
@@ -552,7 +656,9 @@ def _log_sequence_gaps(chunks: list) -> None:
             if prev is not None and n != prev + 1:
                 logging.warning(
                     "Paragraph sequence gap detected: %d → %d (section: %r)",
-                    prev, n, c.get("section", ""),
+                    prev,
+                    n,
+                    c.get("section", ""),
                 )
             prev = n
         except ValueError:
@@ -560,11 +666,11 @@ def _log_sequence_gaps(chunks: list) -> None:
 
 
 def extract_footer(last_chunk: str) -> tuple:
-    lines = last_chunk.split('\n')
+    lines = last_chunk.split("\n")
     for i, line in enumerate(lines):
-        s = re.sub(r'\*+', '', line).strip()   # strip bold markers before matching
-        if _FOOTER_SIG_RE.match(s) or re.match(r'^[.\u2026]{15,}[^.]{0,80}?J\.$', s):
-            return '\n'.join(lines[:i]).strip(), '\n'.join(lines[i:]).strip()
+        s = re.sub(r"\*+", "", line).strip()  # strip bold markers before matching
+        if _FOOTER_SIG_RE.match(s) or re.match(r"^[.\u2026]{15,}[^.]{0,80}?J\.$", s):
+            return "\n".join(lines[:i]).strip(), "\n".join(lines[i:]).strip()
     return last_chunk, ""
 
 
@@ -574,19 +680,19 @@ def parse_footer(footer_raw: str) -> dict:
     if not footer_raw:
         return result
 
-    lines = footer_raw.split('\n')
+    lines = footer_raw.split("\n")
 
     # Pass 1: sig line → next non-blank line is the judge name.
     # Strip bold markers (**) before matching since pymupdf4llm wraps lines in **.
     i = 0
     while i < len(lines):
-        line = re.sub(r'\*+', '', lines[i]).strip()
+        line = re.sub(r"\*+", "", lines[i]).strip()
         if _FOOTER_SIG_RE.match(line):
             j = i + 1
             while j < len(lines) and not lines[j].strip():
                 j += 1
             if j < len(lines):
-                name_line = re.sub(r'\*+', '', lines[j]).strip()
+                name_line = re.sub(r"\*+", "", lines[j]).strip()
                 m = _FOOTER_JUDGE_NAME_RE.match(name_line)
                 if m:
                     name = m.group(1).strip()
@@ -597,19 +703,19 @@ def parse_footer(footer_raw: str) -> dict:
 
     # Pass 2: fallback — any bracketed/parenthesised name after stripping bold.
     if not result["judges"]:
-        _fallback = re.compile(r'^[\[(]([A-Za-z][^\]\)\n]{2,60})[\])]\s*$')
+        _fallback = re.compile(r"^[\[(]([A-Za-z][^\]\)\n]{2,60})[\])]\s*$")
         for line in lines:
-            clean = re.sub(r'\*+', '', line).strip()
+            clean = re.sub(r"\*+", "", line).strip()
             m = _fallback.match(clean)
             if m:
                 name = m.group(1).strip()
                 if name and name not in result["judges"]:
                     result["judges"].append(name)
 
-    clean_footer = re.sub(r'\*+', '', footer_raw)
+    clean_footer = re.sub(r"\*+", "", footer_raw)
     m = _JUDGMENT_DATE_RE.search(clean_footer)
     if m:
-        result["judgment_date"] = m.group(0).strip().rstrip('.')
+        result["judgment_date"] = m.group(0).strip().rstrip(".")
 
     m = _JUDGMENT_LOCATION_RE.search(clean_footer)
     if m:
@@ -627,45 +733,50 @@ def _split_upper_meta(header_raw: str) -> tuple[str, str]:
     """
     m = _UPPER_META_END_RE.search(header_raw)
     if m:
-        return header_raw[:m.end()].strip(), header_raw[m.end():].strip()
+        return header_raw[: m.end()].strip(), header_raw[m.end() :].strip()
     return header_raw, ""
 
 
 def split_paragraphs(text: str):
     # Normalise spaced-letter headings that some PDF extractors produce
-    text = re.sub(r'\bJ\s+U\s+D\s+G\s+(?:E\s+)?M\s+E\s+N\s+T\b', 'JUDGMENT', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bO\s+R\s+D\s+E\s+R\b', 'ORDER', text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\bJ\s+U\s+D\s+G\s+(?:E\s+)?M\s+E\s+N\s+T\b",
+        "JUDGMENT",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bO\s+R\s+D\s+E\s+R\b", "ORDER", text, flags=re.IGNORECASE)
 
-    BOLD  = re.compile(r"(?=^\*\*\d+\.\*\*)", re.MULTILINE)
+    BOLD = re.compile(r"(?=^\*\*\d+\.\*\*)", re.MULTILINE)
     PLAIN = re.compile(r"(?=^_?\d+\._?\s+\S)", re.MULTILINE)
 
-    bold_first  = BOLD.search(text)
+    bold_first = BOLD.search(text)
     plain_first = PLAIN.search(text)
     if bold_first is None and plain_first is None:
         return text.strip(), [], ""
 
     pattern = BOLD if bold_first else PLAIN
-    first   = bold_first if bold_first else plain_first
+    first = bold_first if bold_first else plain_first
 
     full_header = text[: first.start()].strip()
     upper_meta_raw, post_judgement = _split_upper_meta(full_header)
-    header_raw = upper_meta_raw   # alias used by the rest of this function
-    body_text  = text[first.start():]
+    header_raw = upper_meta_raw  # alias used by the rest of this function
+    body_text = text[first.start() :]
 
     # Pass 1 — detect section headings (must be surrounded by blank lines)
-    blocks = re.split(r'(\n\n+)', body_text)
+    blocks = re.split(r"(\n\n+)", body_text)
     sections: list[tuple[str, str]] = []
     current_name: str = ""
     current_parts: list[str] = []
     for block in blocks:
         stripped = block.strip()
         if stripped and _is_section_heading(stripped):
-            sections.append((current_name, ''.join(current_parts)))
-            current_name = re.sub(r'^#{1,4}\s*|\*{1,2}', '', stripped).strip()
+            sections.append((current_name, "".join(current_parts)))
+            current_name = re.sub(r"^#{1,4}\s*|\*{1,2}", "", stripped).strip()
             current_parts = []
         else:
             current_parts.append(block)
-    sections.append((current_name, ''.join(current_parts)))
+    sections.append((current_name, "".join(current_parts)))
     sections = [(n, t) for n, t in sections if t.strip()]
 
     # Pass 2 — split each section on numbered paragraphs, build chunk dicts
@@ -691,12 +802,14 @@ def split_paragraphs(text: str):
             body = para_body(rs)
             if j == 0 and leading_body:
                 body = leading_body + "\n\n" + body
-            sec_dicts.append({
-                "para_no": para_number(rs),
-                "section": sec_name,
-                "body":    body,
-                "is_section_start": False,
-            })
+            sec_dicts.append(
+                {
+                    "para_no": para_number(rs),
+                    "section": sec_name,
+                    "body": body,
+                    "is_section_start": False,
+                }
+            )
         if sec_dicts:
             sec_dicts[0]["is_section_start"] = True
         all_chunks.extend(sec_dicts)
@@ -713,6 +826,12 @@ def split_paragraphs(text: str):
 
     all_chunks = _detect_implicit_para_1(post_judgement, all_chunks)
 
+    for i, c in enumerate(all_chunks):
+        c["prev_para_no"] = all_chunks[i - 1]["para_no"] if i > 0 else None
+        c["next_para_no"] = (
+            all_chunks[i + 1]["para_no"] if i + 1 < len(all_chunks) else None
+        )
+
     return upper_meta_raw, all_chunks, footer_raw
 
 
@@ -724,13 +843,13 @@ def _detect_implicit_para_1(post_judgement: str, chunks: list) -> list:
         return chunks
     if not post_judgement:
         return chunks
-    implicit_body = strip_page_numbers(_DIGITAL_SIG_RE.sub('', post_judgement))
+    implicit_body = strip_page_numbers(_DIGITAL_SIG_RE.sub("", post_judgement))
     if not implicit_body:
         return chunks
     synthetic = {
         "para_no": "1",
         "section": chunks[0]["section"],
-        "body":    implicit_body,
+        "body": implicit_body,
         "is_section_start": True,
     }
     chunks[0]["is_section_start"] = False
@@ -764,14 +883,16 @@ def extract_markdown(pdf_bytes: bytes) -> str:
             for i, chunk in enumerate(page_chunks):
                 if i in scanned:
                     pix = doc[i].get_pixmap(dpi=300)
-                    img = PIL.Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    img = PIL.Image.frombytes(
+                        "RGB", [pix.width, pix.height], pix.samples
+                    )
                     parts.append(pytesseract.image_to_string(img, lang="eng"))
                 else:
                     parts.append(chunk["text"])
             doc.close()
             md = "\n\n".join(parts)
 
-        md = re.sub(r'<br\s*/?>', ' ', md, flags=re.IGNORECASE)
+        md = re.sub(r"<br\s*/?>", " ", md, flags=re.IGNORECASE)
         return md
     finally:
         try:
@@ -801,75 +922,83 @@ def parse_metadata(raw: str) -> dict:
         "toc_md": "",
     }
 
-    normalised = re.sub(r'\bW\s+I\s+T\s+H\b', 'WITH', raw, flags=re.IGNORECASE)
-    if re.search(r'\bWITH\b', normalised, re.IGNORECASE):
+    normalised = re.sub(r"\bW\s+I\s+T\s+H\b", "WITH", raw, flags=re.IGNORECASE)
+    if re.search(r"\bWITH\b", normalised, re.IGNORECASE):
         meta["is_batch_matter"] = True
-    header = re.split(r'\bWITH\b', normalised, maxsplit=1, flags=re.IGNORECASE)[0]
+    header = re.split(r"\bWITH\b", normalised, maxsplit=1, flags=re.IGNORECASE)[0]
 
-    m = re.search(r'(\d{4}\s+INSC\s+\d+)', header)
+    m = re.search(r"(\d{4}\s+INSC\s+\d+)", header)
     if m:
         meta["citation"] = m.group(1).strip()
 
-    if re.search(r'NON[-\s]?REPORTABLE', raw, re.IGNORECASE):
+    if re.search(r"NON[-\s]?REPORTABLE", raw, re.IGNORECASE):
         meta["reportable_status"] = "NON-REPORTABLE"
-    elif re.search(r'REPORTABLE', raw, re.IGNORECASE):
+    elif re.search(r"REPORTABLE", raw, re.IGNORECASE):
         meta["reportable_status"] = "REPORTABLE"
 
-    if re.search(r'IN\s+THE\s+SUPREME\s+COURT\s+OF\s+INDIA', header, re.IGNORECASE):
+    if re.search(r"IN\s+THE\s+SUPREME\s+COURT\s+OF\s+INDIA", header, re.IGNORECASE):
         meta["court"] = "Supreme Court of India"
 
     m = re.search(
-        r'((?:CRIMINAL|CIVIL|ORIGINAL)\s+(?:ORIGINAL|APPELLATE|MISC(?:ELLANEOUS)?)'
-        r'(?:\s+JURISDICTION)?)',
-        header, re.IGNORECASE,
+        r"((?:CRIMINAL|CIVIL|ORIGINAL)\s+(?:ORIGINAL|APPELLATE|MISC(?:ELLANEOUS)?)"
+        r"(?:\s+JURISDICTION)?)",
+        header,
+        re.IGNORECASE,
     )
     if m:
-        raw_jur = re.sub(r'\s+', ' ', m.group(0)).strip()
-        if not raw_jur.upper().endswith('JURISDICTION'):
-            raw_jur += ' Jurisdiction'
+        raw_jur = re.sub(r"\s+", " ", m.group(0)).strip()
+        if not raw_jur.upper().endswith("JURISDICTION"):
+            raw_jur += " Jurisdiction"
         meta["jurisdiction"] = raw_jur.title()
 
     _CASE_PAT = re.compile(
-        r'(WRIT\s+PETITION(?:\s*\([^)]+\))?'
-        r'|CRIMINAL\s+APPEAL(?:\s*\([^)]+\))?'
-        r'|CIVIL\s+APPEAL(?:\s*\([^)]+\))?'
-        r'|SPECIAL\s+LEAVE\s+PETITION(?:\s*\([^)]+\))?'
-        r'|SLP(?:\s*\([^)]+\))?'
-        r'|TRANSFER\s+PETITION(?:\s*\([^)]+\))?'
-        r'|CONTEMPT\s+PETITION(?:\s*\([^)]+\))?'
-        r'|REVIEW\s+PETITION(?:\s*\([^)]+\))?'
-        r'|CURATIVE\s+PETITION(?:\s*\([^)]+\))?'
-        r'|ORIGINAL\s+PETITION(?:\s*\([^)]+\))?)'
-        r'\s+(?:NO|NOS)\.?\s*([\d,\s&/-]+?)\s+OF\s+(\d{4})',
+        r"(WRIT\s+PETITION(?:\s*\([^)]+\))?"
+        r"|CRIMINAL\s+APPEAL(?:\s*\([^)]+\))?"
+        r"|CIVIL\s+APPEAL(?:\s*\([^)]+\))?"
+        r"|SPECIAL\s+LEAVE\s+PETITION(?:\s*\([^)]+\))?"
+        r"|SLP(?:\s*\([^)]+\))?"
+        r"|TRANSFER\s+PETITION(?:\s*\([^)]+\))?"
+        r"|CONTEMPT\s+PETITION(?:\s*\([^)]+\))?"
+        r"|REVIEW\s+PETITION(?:\s*\([^)]+\))?"
+        r"|CURATIVE\s+PETITION(?:\s*\([^)]+\))?"
+        r"|ORIGINAL\s+PETITION(?:\s*\([^)]+\))?)"
+        r"\s+(?:NO|NOS)\.?\s*([\d,\s&/-]+?)\s+OF\s+(\d{4})",
         re.IGNORECASE,
     )
     m = _CASE_PAT.search(header)
     if m:
-        case_type_raw = re.sub(r'\s+', ' ', m.group(1)).strip()
+        case_type_raw = re.sub(r"\s+", " ", m.group(1)).strip()
         meta["case_type"] = case_type_raw.title()
-        meta["case_number"] = re.sub(r'\s+', '', m.group(2).strip())  # full range e.g. "4872-4873"
+        meta["case_number"] = re.sub(
+            r"\s+", "", m.group(2).strip()
+        )  # full range e.g. "4872-4873"
         meta["case_year"] = m.group(3).strip()
 
     # Separator pattern covering ASCII dots and Unicode ellipsis (…, U+2026)
-    _ELLIPSIS_SEP = r'\s*[.\u2026]+\s*'
+    _ELLIPSIS_SEP = r"\s*[.\u2026]+\s*"
 
     def _clean_party(raw_name: str) -> str:
-        s = re.sub(r'\*+', '', raw_name)
-        s = re.sub(r'[.\u2026]{2,}', '', s)    # strip dot/ellipsis runs
+        s = re.sub(r"\*+", "", raw_name)
+        s = re.sub(r"[.\u2026]{2,}", "", s)  # strip dot/ellipsis runs
         s = re.sub(
-            r'\s*[\(\[]?(?:Appellant|Petitioner|Respondent|Opposite Party)'
-            r's?\s*[\)\]]?\s*$', '', s, flags=re.IGNORECASE,
+            r"\s*[\(\[]?(?:Appellant|Petitioner|Respondent|Opposite Party)"
+            r"s?\s*[\)\]]?\s*$",
+            "",
+            s,
+            flags=re.IGNORECASE,
         )
-        return s.strip().strip('.')
+        return s.strip().strip(".")
 
     # Priority 1: bold-formatted names (pymupdf4llm wraps prominent text in **)
     m_pet = re.search(
-        r'^\*\*([^*\n]+)\*\*[^\n]*\b(?:APPELLANT|PETITIONER)\b',
-        header, re.IGNORECASE | re.MULTILINE,
+        r"^\*\*([^*\n]+)\*\*[^\n]*\b(?:APPELLANT|PETITIONER)\b",
+        header,
+        re.IGNORECASE | re.MULTILINE,
     )
     m_res = re.search(
-        r'^\*\*([^*\n]+)\*\*[^\n]*\bRESPONDENT\b',
-        header, re.IGNORECASE | re.MULTILINE,
+        r"^\*\*([^*\n]+)\*\*[^\n]*\bRESPONDENT\b",
+        header,
+        re.IGNORECASE | re.MULTILINE,
     )
     if m_pet:
         meta["petitioner_or_appellant"] = _clean_party(m_pet.group(1))
@@ -879,15 +1008,17 @@ def parse_metadata(raw: str) -> dict:
     # Priority 2: name ….. Role  (with or without trailing s / (s))
     if not meta["petitioner_or_appellant"]:
         m = re.search(
-            r'^([A-Z][^\n\u2026]+?)' + _ELLIPSIS_SEP + r'(?:Appellant|Petitioner)s?\b',
-            header, re.IGNORECASE | re.MULTILINE,
+            r"^([A-Z][^\n\u2026]+?)" + _ELLIPSIS_SEP + r"(?:Appellant|Petitioner)s?\b",
+            header,
+            re.IGNORECASE | re.MULTILINE,
         )
         if m:
             meta["petitioner_or_appellant"] = _clean_party(m.group(1))
     if not meta["respondent"]:
         m = re.search(
-            r'^([A-Z][^\n\u2026]+?)' + _ELLIPSIS_SEP + r'Respondents?\b',
-            header, re.IGNORECASE | re.MULTILINE,
+            r"^([A-Z][^\n\u2026]+?)" + _ELLIPSIS_SEP + r"Respondents?\b",
+            header,
+            re.IGNORECASE | re.MULTILINE,
         )
         if m:
             meta["respondent"] = _clean_party(m.group(1))
@@ -895,8 +1026,9 @@ def parse_metadata(raw: str) -> dict:
     # Priority 3: VERSUS inline on the same line
     if not meta["petitioner_or_appellant"] and not meta["respondent"]:
         m_vs = re.search(
-            r'^(.+?)\s+(?:VERSUS|vs?\.)\s+(.+?)$',
-            header, re.IGNORECASE | re.MULTILINE,
+            r"^(.+?)\s+(?:VERSUS|vs?\.)\s+(.+?)$",
+            header,
+            re.IGNORECASE | re.MULTILINE,
         )
         if m_vs:
             meta["petitioner_or_appellant"] = _clean_party(m_vs.group(1))
@@ -905,25 +1037,30 @@ def parse_metadata(raw: str) -> dict:
     # Priority 4: VERSUS on its own line
     if not meta["petitioner_or_appellant"] and not meta["respondent"]:
         m_vs = re.search(
-            r'^([^\n]+)\n\s*(?:VERSUS|vs?\.)\s*\n\s*([^\n]+)',
-            header, re.IGNORECASE | re.MULTILINE,
+            r"^([^\n]+)\n\s*(?:VERSUS|vs?\.)\s*\n\s*([^\n]+)",
+            header,
+            re.IGNORECASE | re.MULTILINE,
         )
         if m_vs:
             meta["petitioner_or_appellant"] = _clean_party(m_vs.group(1))
             meta["respondent"] = _clean_party(m_vs.group(2))
 
     if meta["petitioner_or_appellant"] and meta["respondent"]:
-        meta["case_title"] = f"{meta['petitioner_or_appellant']} vs {meta['respondent']}"
+        meta["case_title"] = (
+            f"{meta['petitioner_or_appellant']} vs {meta['respondent']}"
+        )
 
-    m = re.search(r'#\s+\*\*([\w\s.,]+J\.)\*\*|^([\w\s.,]+J\.):?\s*$', raw, re.MULTILINE)
+    m = re.search(
+        r"#\s+\*\*([\w\s.,]+J\.)\*\*|^([\w\s.,]+J\.):?\s*$", raw, re.MULTILINE
+    )
     if m:
         meta["judge"] = (m.group(1) or m.group(2)).strip()
 
     m = _AUTHORING_JUDGE_RE.search(raw)
     if m:
-        meta["authoring_judge"] = re.sub(r'\*+', '', m.group(1)).strip()
+        meta["authoring_judge"] = re.sub(r"\*+", "", m.group(1)).strip()
 
-    m = re.search(r'(##\s+\*\*INDEX\*\*.*)', raw, re.DOTALL)
+    m = re.search(r"(##\s+\*\*INDEX\*\*.*)", raw, re.DOTALL)
     if m:
         meta["toc_md"] = m.group(1).strip()
 
@@ -956,21 +1093,41 @@ _META_LLM_SYSTEM = (
 )
 
 _META_EMPTY: dict = {
-    "citation": "", "reportable_status": "", "court": "", "jurisdiction": "",
-    "case_type": "", "case_number": "", "case_year": "",
-    "petitioner_or_appellant": "", "respondent": "", "authoring_judge": "",
-    "case_title": "", "is_batch_matter": False, "judge": "", "judges": [],
-    "judgment_date": "", "judgment_location": "", "toc_md": "",
+    "citation": "",
+    "reportable_status": "",
+    "court": "",
+    "jurisdiction": "",
+    "case_type": "",
+    "case_number": "",
+    "case_year": "",
+    "petitioner_or_appellant": "",
+    "respondent": "",
+    "authoring_judge": "",
+    "case_title": "",
+    "is_batch_matter": False,
+    "judge": "",
+    "judges": [],
+    "judgment_date": "",
+    "judgment_location": "",
+    "toc_md": "",
 }
 # SystemMessage (not tuple) prevents template parsing of the JSON schema inside.
-_META_PROMPT = ChatPromptTemplate.from_messages([
-    SystemMessage(content=_META_LLM_SYSTEM),
-    ("human", "{text}"),
-])
+_META_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        SystemMessage(content=_META_LLM_SYSTEM),
+        ("human", "{text}"),
+    ]
+)
 
 
 def parse_metadata_llm(raw: str) -> dict:
-    chain = _META_PROMPT | get_chunk_llm() | StrOutputParser() | _STRIP_THINK | _STRIP_FENCES
+    chain = (
+        _META_PROMPT
+        | get_chunk_llm()
+        | StrOutputParser()
+        | _STRIP_THINK
+        | _STRIP_FENCES
+    )
     try:
         data = json.loads(chain.invoke({"text": raw[:3_000]}))
         result = {**_META_EMPTY}
@@ -980,7 +1137,9 @@ def parse_metadata_llm(raw: str) -> dict:
             if key == "is_batch_matter":
                 result[key] = bool(data[key])
             elif key == "judges":
-                result[key] = [str(j) for j in data[key]] if isinstance(data[key], list) else []
+                result[key] = (
+                    [str(j) for j in data[key]] if isinstance(data[key], list) else []
+                )
             elif data[key] is None:
                 pass  # keep _META_EMPTY default; _merge_metadata will fall back to regex
             else:
@@ -1006,11 +1165,12 @@ def _merge_metadata(llm: dict, regex: dict) -> dict:
 
 # ── NER ────────────────────────────────────────────────────────────────────────
 
+
 def _extract_legal_spans(text: str) -> list[tuple[str, str]]:
     nlp = get_nlp()
     if nlp is None:
         return []
-    clean = re.sub(r'\*+', '', text).strip()
+    clean = re.sub(r"\*+", "", text).strip()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         doc = nlp(clean)
@@ -1022,6 +1182,7 @@ def _extract_legal_spans(text: str) -> list[tuple[str, str]]:
 
 
 # ── Classification ─────────────────────────────────────────────────────────────
+
 
 def _resolve_role(raw_role: str) -> str:
     if not raw_role:
@@ -1042,12 +1203,12 @@ def _resolve_role(raw_role: str) -> str:
 
 def _context_snippets(chunks: list, idx: int, window: int = 60) -> dict[str, str]:
     def _snippet(c: dict) -> str:
-        words = re.sub(r'\*+', '', c["body"]).split()
+        words = re.sub(r"\*+", "", c["body"]).split()
         return " ".join(words[:window])
 
     prev = _snippet(chunks[idx - 1]) if idx > 0 else ""
     curr = _snippet(chunks[idx])
-    nxt  = _snippet(chunks[idx + 1]) if idx + 1 < len(chunks) else ""
+    nxt = _snippet(chunks[idx + 1]) if idx + 1 < len(chunks) else ""
     return {"prev": prev, "curr": curr, "next": nxt}
 
 
@@ -1071,27 +1232,44 @@ async def _invoke_chain_async(pn: str, invoke_args: dict) -> dict:
         try:
             raw = await chain.ainvoke(invoke_args)
             try:
-                json_str = re.sub(r'^```[a-z]*\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE)
+                json_str = re.sub(
+                    r"^```[a-z]*\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE
+                )
                 obj = json.loads(json_str)
                 raw_role = str(obj.get("role", obj.get("label", ""))).strip()
-                return {"para_no": pn, "role": _resolve_role(raw_role),
-                        "confidence": float(obj.get("confidence", 1.0))}
+                return {
+                    "para_no": pn,
+                    "role": _resolve_role(raw_role),
+                    "confidence": float(obj.get("confidence", 1.0)),
+                }
             except Exception:
-                m = (re.search(r'"role"\s*:\s*"([^"]+)"', raw) or
-                     re.search(r'"label"\s*:\s*"([^"]+)"', raw) or
-                     re.search(r'\[([A-Z_]+)\]', raw))
+                m = (
+                    re.search(r'"role"\s*:\s*"([^"]+)"', raw)
+                    or re.search(r'"label"\s*:\s*"([^"]+)"', raw)
+                    or re.search(r"\[([A-Z_]+)\]", raw)
+                )
                 role = _resolve_role(
-                    m.group(1) if m and '[' not in m.group(0) else
-                    f"[{m.group(1)}]" if m else ""
+                    m.group(1)
+                    if m and "[" not in m.group(0)
+                    else f"[{m.group(1)}]"
+                    if m
+                    else ""
                 )
                 return {"para_no": pn, "role": role, "confidence": 0.5}
         except Exception as exc:
             last_exc = exc
             ra = _retry_after_delay(exc)
             next_delay = ra if ra else float(2 ** (attempt + 1))
-            logging.warning("_invoke_chain_async attempt %d/%d failed for para %s: %s",
-                            attempt + 1, _CLASSIFY_RETRIES + 1, pn, exc)
-    logging.error("_invoke_chain_async all retries exhausted for para %s: %s", pn, last_exc)
+            logging.warning(
+                "_invoke_chain_async attempt %d/%d failed for para %s: %s",
+                attempt + 1,
+                _CLASSIFY_RETRIES + 1,
+                pn,
+                exc,
+            )
+    logging.error(
+        "_invoke_chain_async all retries exhausted for para %s: %s", pn, last_exc
+    )
     return {"para_no": pn, "role": "Not classified", "confidence": 0.0}
 
 
@@ -1109,12 +1287,30 @@ async def classify_paragraph_async(chunks: list, idx: int) -> dict:
 
 # ── Embeddings & retrieval ─────────────────────────────────────────────────────
 
-def _build_index(chunks: list) -> tuple:
-    embedder  = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
+
+def _safe_bodies(chunks):
+    return [c["body"].strip() or "empty paragraph" for c in chunks]
+
+
+def _build_index(chunks: list) -> IndexBundle:
+    embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
     para_keys = [c["para_no"] for c in chunks]
-    # Ensure no chunk has an empty body — empty strings cause NaN embeddings from bge-m3
-    bodies    = [c["body"].strip() or "empty paragraph" for c in chunks]
-    raw_vecs  = embedder.embed_documents(bodies)
+    bodies = _safe_bodies(chunks)
+    from rank_bm25 import BM25Okapi
+
+    tokenized = [b.lower().split() for b in bodies]
+    bm25 = BM25Okapi(tokenized)
+    raw_vecs: list = []
+    for i in range(0, len(bodies), _EMBED_BATCH):
+        batch = bodies[i : i + _EMBED_BATCH]
+        try:
+            raw_vecs.extend(embedder.embed_documents(batch))
+        except Exception:
+            for body in batch:
+                try:
+                    raw_vecs.append(embedder.embed_query(body))
+                except Exception:
+                    raw_vecs.append([0.0] * _SIMILAR_EMBED_DIM)
     vecs = np.array(raw_vecs, dtype=np.float32)
 
     # ── Guard: sanitize NaN/Inf values before normalising ─────────────────────
@@ -1127,7 +1323,8 @@ def _build_index(chunks: list) -> tuple:
         logging.warning(
             "_build_index: %d NaN and %d Inf vectors detected from embedder; "
             "replacing with zeros before normalisation.",
-            nan_count, inf_count,
+            nan_count,
+            inf_count,
         )
     vecs = np.nan_to_num(vecs, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -1146,21 +1343,22 @@ def _build_index(chunks: list) -> tuple:
     # ──────────────────────────────────────────────────────────────────────────
 
     faiss.normalize_L2(vecs)
-    dim   = vecs.shape[1]
+    dim = vecs.shape[1]
     index = faiss.IndexHNSWFlat(dim, 32)
     index.hnsw.efConstruction = 200
-    index.hnsw.efSearch        = 64
+    index.hnsw.efSearch = 64
     index.add(vecs)
-    return index, para_keys
+    return IndexBundle(index, para_keys, bm25, tokenized)
 
 
 def _retrieve_chunks(
     question: str,
     chunks: list,
-    index_bundle: tuple,
+    index_bundle: IndexBundle,
     k: int = 5,
 ) -> list[tuple[str, str]]:
-    faiss_index, para_keys = index_bundle
+    faiss_index = index_bundle.faiss_index
+    para_keys = index_bundle.para_keys
     embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
     try:
         q_vec = np.array([embedder.embed_query(question)], dtype=np.float32)
@@ -1171,7 +1369,9 @@ def _retrieve_chunks(
     q_vec = np.nan_to_num(q_vec, nan=0.0, posinf=0.0, neginf=0.0)
     q_norm = np.linalg.norm(q_vec)
     if q_norm == 0.0:
-        logging.warning("_retrieve_chunks: query vector is zero-norm; results will be arbitrary.")
+        logging.warning(
+            "_retrieve_chunks: query vector is zero-norm; results will be arbitrary."
+        )
         q_vec[0] = 1.0 / np.sqrt(q_vec.shape[1])
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -1187,6 +1387,7 @@ def _retrieve_chunks(
 
 # ── Chat streaming ─────────────────────────────────────────────────────────────
 
+
 def _history_to_messages(history: list[dict]) -> list:
     """Convert frontend chat history dicts to LangChain message objects."""
     msgs = []
@@ -1198,16 +1399,107 @@ def _history_to_messages(history: list[dict]) -> list:
     return msgs
 
 
-async def stream_chat(question: str, chunks: list, history: list[dict], doc_id: str | None = None):
-    # Immediately signal the client so it receives a response before any blocking work
+def _bm25_retrieve(question, chunks, bundle, top_k=20):
+    scores = bundle.bm25.get_scores(question.lower().split())
+    idxs = scores.argsort()[::-1][:top_k]
+    bm = {c["para_no"]: c["body"] for c in chunks}
+    return [
+        {
+            "para_no": bundle.para_keys[i],
+            "body": bm[bundle.para_keys[i]],
+            "score": float(scores[i]),
+            "source": "bm25",
+        }
+        for i in idxs
+        if bundle.para_keys[i] in bm
+    ]
+
+
+def _section_retrieve(question, chunks):
+    ROLES = {
+        "Arg · Petitioner": r"\b(petitioner|appellant|argued|contended)\b",
+        "Arg · Respondent": r"\b(respondent|state|replied)\b",
+        "Ratio Decidendi": r"\b(ratio|held|holding|decidendi)\b",
+        "Facts": r"\b(fact|background|history|incident)\b",
+        "Disposition": r"\b(disposed|dismissed|allowed|decree)\b",
+    }
+    out = []
+    for role, pat in ROLES.items():
+        if re.search(pat, question, re.IGNORECASE):
+            out += [
+                {
+                    "para_no": c["para_no"],
+                    "body": c["body"],
+                    "score": 1.0,
+                    "source": "section",
+                }
+                for c in chunks
+                if c.get("role") == role
+            ]
+    return out
+
+
+def _rrf_fuse(lists, k=60):
+    scores, bodies, sources = {}, {}, {}
+    for lst in lists:
+        for rank, item in enumerate(lst):
+            p = item["para_no"]
+            scores[p] = scores.get(p, 0.0) + 1.0 / (k + rank + 1)
+            bodies[p] = item["body"]
+            sources.setdefault(p, item["source"])
+    return sorted(
+        [
+            {"para_no": p, "body": bodies[p], "score": s, "source": sources[p]}
+            for p, s in scores.items()
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+
+
+async def stream_chat(
+    question: str, chunks: list, history: list[dict], doc_id: str | None = None
+):
     yield f"data: {json.dumps({'token': '', 'status': 'retrieving', 'done': False})}\n\n"
 
     loop = asyncio.get_running_loop()
     embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
 
+    # ── STEP A: metadata short-circuit ────────────────────────────────────────
+    if (
+        doc_id
+        and re.search(
+            r"\b(who|judge|court|date|citation|parties|reportable|outcome|decided)\b",
+            question,
+            re.IGNORECASE,
+        )
+        and not re.search(
+            r"\b(ratio|argued|section|article|issue|fact)\b",
+            question,
+            re.IGNORECASE,
+        )
+        and doc_id in _doc_store
+    ):
+        meta = _doc_store[doc_id].get("metadata", {})
+        yield f"data: {json.dumps({'token': json.dumps(meta), 'done': True, 'sources': ['metadata']})}\n\n"
+        return
+
+    # ── STEP B: summary short-circuit ─────────────────────────────────────────
+    if re.search(
+        r"\b(summar|overview|what is this case|explain this|what happened|what was decided)\b",
+        question,
+        re.IGNORECASE,
+    ):
+        summary = _doc_store.get(doc_id, {}).get("summary", "") if doc_id else ""
+        if summary:
+            yield f"data: {json.dumps({'token': summary, 'done': True, 'sources': ['summary']})}\n\n"
+            return
+
+    # ── Index setup ────────────────────────────────────────────────────────────
+    _transient_bundle: list = [None]
+
     if doc_id:
         if doc_id not in _embed_events:
-            # First caller: create event, kick off index build as a background task
             evt = asyncio.Event()
             _embed_events[doc_id] = evt
 
@@ -1223,72 +1515,239 @@ async def stream_chat(question: str, chunks: list, history: list[dict], doc_id: 
             asyncio.create_task(_build_and_signal())
         else:
             evt = _embed_events[doc_id]
-
-        # Overlap index-readiness wait with query embedding
-        try:
-            _, q_vec_raw = await asyncio.gather(
-                asyncio.wait_for(evt.wait(), timeout=60),
-                loop.run_in_executor(None, embedder.embed_query, question),
-            )
-        except asyncio.TimeoutError:
-            yield f"data: {json.dumps({'token': '[Index build timed out]', 'done': True, 'sources': []})}\n\n"
-            return
-        except Exception as exc:
-            yield f"data: {json.dumps({'token': f'[Retrieval error: {exc}]', 'done': True, 'sources': []})}\n\n"
-            return
-
-        index_bundle = _embedding_cache.get(doc_id)
-        if index_bundle is None:
-            yield f"data: {json.dumps({'token': '[Index unavailable]', 'done': True, 'sources': []})}\n\n"
-            return
     else:
-        # No doc_id: build index and embed query in parallel (no caching)
-        try:
-            index_bundle, q_vec_raw = await asyncio.gather(
-                loop.run_in_executor(None, _build_index, chunks),
-                loop.run_in_executor(None, embedder.embed_query, question),
-            )
-        except Exception as exc:
-            yield f"data: {json.dumps({'token': f'[Index error: {exc}]', 'done': True, 'sources': []})}\n\n"
-            return
+        evt = asyncio.Event()
 
-    # FAISS search with pre-computed query vector (fast, runs synchronously)
-    faiss_index, para_keys = index_bundle
+        async def _build_and_signal() -> None:
+            try:
+                _transient_bundle[0] = await loop.run_in_executor(
+                    None, _build_index, chunks
+                )
+            except Exception as _exc:
+                logging.warning("Index build failed (no doc_id): %s", _exc)
+            finally:
+                evt.set()
+
+        asyncio.create_task(_build_and_signal())
+
+    # ── STEP C: parallel router + index-wait + query-embed ────────────────────
+    _route_prompt = (
+        "Output ONLY JSON (no markdown):\n"
+        '{"tools":[...],"hyde":bool,"reject":bool,"complexity":"simple"|"complex"}\n'
+        "tools: metadata=case identity, section=role-based, bm25=exact terms,\n"
+        "  dense=conceptual, summary=overview.\n"
+        "  Always include dense unless tools is [metadata] or [summary] only.\n"
+        "reject=true ONLY if the question has zero connection to legal/judicial matters.\n"
+        "complexity=simple for single-fact lookups; complex for multi-part legal analysis.\n"
+        f"Question: {question}"
+    )
+
+    async def _route_async() -> dict:
+        try:
+            llm = get_chunk_llm()
+            raw = await loop.run_in_executor(None, llm.invoke, _route_prompt)
+            text = raw.content if hasattr(raw, "content") else str(raw)
+            return json.loads(text)
+        except Exception:
+            return {"tools": ["bm25", "dense"], "hyde": False}
+
     try:
-        q_vec = np.array([q_vec_raw], dtype=np.float32)
-        q_vec = np.nan_to_num(q_vec, nan=0.0, posinf=0.0, neginf=0.0)
-        if np.linalg.norm(q_vec) == 0.0:
-            logging.warning("stream_chat: query vector is zero-norm; results will be arbitrary.")
-            q_vec[0] = 1.0 / np.sqrt(q_vec.shape[1])
-        faiss.normalize_L2(q_vec)
-        _, idxs = faiss_index.search(q_vec, min(5, len(para_keys)))
-        body_map = {c["para_no"]: c["body"] for c in chunks}
-        retrieved = [
-            (para_keys[i], body_map[para_keys[i]])
-            for i in idxs[0]
-            if i >= 0 and para_keys[i] in body_map
-        ]
+        route_result, _, q_vec_raw = await asyncio.gather(
+            _route_async(),
+            asyncio.wait_for(evt.wait(), timeout=60),
+            loop.run_in_executor(None, embedder.embed_query, question[:1800]),
+        )
+    except asyncio.TimeoutError:
+        yield f"data: {json.dumps({'token': '[Index build timed out]', 'done': True, 'sources': []})}\n\n"
+        return
     except Exception as exc:
         yield f"data: {json.dumps({'token': f'[Retrieval error: {exc}]', 'done': True, 'sources': []})}\n\n"
         return
 
-    context = "\n\n".join(f"[Para {pn}] {body}" for pn, body in retrieved)
-    sources  = [f"Para {pn}" for pn, _ in retrieved]
-    chain    = _get_rag_chain()
+    index_bundle = _embedding_cache.get(doc_id) if doc_id else _transient_bundle[0]
+    if index_bundle is None:
+        yield f"data: {json.dumps({'token': '[Index unavailable]', 'done': True, 'sources': []})}\n\n"
+        return
 
+    if route_result.get("reject", False):
+        yield (
+            f"data: {json.dumps({'token': 'This question does not appear to relate to the loaded judgment. Please ask something about the case, its parties, legal issues, or the court’s reasoning.', 'done': True, 'sources': []})}\n\n"
+        )
+        return
+
+    tools = route_result.get("tools", ["bm25", "dense"])
+    hyde = route_result.get("hyde", False)
+
+    # ── STEP D: concurrent retrieval ──────────────────────────────────────────
+    retrieval_coros: list = []
+
+    if "dense" in tools:
+
+        async def _dense_retrieve() -> list:
+            q_vec = np.array([q_vec_raw], dtype=np.float32)
+            q_vec = np.nan_to_num(q_vec, nan=0.0, posinf=0.0, neginf=0.0)
+            if np.linalg.norm(q_vec) == 0.0:
+                q_vec[0] = 1.0 / np.sqrt(q_vec.shape[1])
+            faiss.normalize_L2(q_vec)
+            search_vec = q_vec
+            if hyde:
+                hyde_prompt = (
+                    "Write a one-paragraph Indian Supreme Court judgment "
+                    f"excerpt answering: {question}"
+                )
+                try:
+                    hyde_raw = await loop.run_in_executor(
+                        None, embedder.embed_query, hyde_prompt[:1800]
+                    )
+                    h_vec = np.array([hyde_raw], dtype=np.float32)
+                    h_vec = np.nan_to_num(h_vec, nan=0.0, posinf=0.0, neginf=0.0)
+                    if np.linalg.norm(h_vec) > 0.0:
+                        faiss.normalize_L2(h_vec)
+                        search_vec = (q_vec + h_vec) / 2.0
+                        faiss.normalize_L2(search_vec)
+                except Exception:
+                    pass
+            fi = index_bundle.faiss_index
+            pk = index_bundle.para_keys
+            _, idxs = fi.search(search_vec, min(20, len(pk)))
+            bm = {c["para_no"]: c["body"] for c in chunks}
+            return [
+                {
+                    "para_no": pk[i],
+                    "body": bm[pk[i]],
+                    "score": 1.0 - rank * 0.05,
+                    "source": "dense",
+                }
+                for rank, i in enumerate(idxs[0])
+                if i >= 0 and pk[i] in bm
+            ]
+
+        retrieval_coros.append(_dense_retrieve())
+
+    if "bm25" in tools:
+        retrieval_coros.append(
+            loop.run_in_executor(None, _bm25_retrieve, question, chunks, index_bundle)
+        )
+
+    if "section" in tools:
+        retrieval_coros.append(
+            loop.run_in_executor(None, _section_retrieve, question, chunks)
+        )
+
+    raw_results = (
+        await asyncio.gather(*retrieval_coros, return_exceptions=True)
+        if retrieval_coros
+        else []
+    )
+    lists = [r for r in raw_results if isinstance(r, list)]
+
+    # ── STEP E: fuse + expand + rerank ────────────────────────────────────────
+    fused = _rrf_fuse(lists)
+
+    para_map = {c["para_no"]: c for c in chunks}
+    present = {item["para_no"] for item in fused}
+    expansions: list = []
+    for item in fused[:20]:
+        c = para_map.get(item["para_no"], {})
+        for nb_key in ("prev_para_no", "next_para_no"):
+            nb_pn = c.get(nb_key)
+            if nb_pn and nb_pn not in present and nb_pn in para_map:
+                expansions.append(
+                    {
+                        "para_no": nb_pn,
+                        "body": para_map[nb_pn]["body"],
+                        "score": item["score"] * 0.7,
+                        "source": "context_expansion",
+                    }
+                )
+                present.add(nb_pn)
+
+    candidates = fused + expansions
     try:
-        async for tok in chain.astream({
-            "context":  context,
-            "history":  _history_to_messages(history),
-            "question": question,
-        }):
+        cross_enc = get_cross_encoder()
+        pairs = [(question, item["body"]) for item in candidates]
+        ce_scores = await loop.run_in_executor(None, cross_enc.predict, pairs)
+        ce_arr = np.array(ce_scores, dtype=np.float32)
+        sigmoid_scores = (1.0 / (1.0 + np.exp(-ce_arr))).tolist()
+        for item, s in zip(candidates, sigmoid_scores):
+            item["score"] = float(s)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+    except Exception as exc:
+        logging.warning("Rerank failed: %s", exc)
+
+    top5 = candidates[:5]
+
+    # ── STEP F: rolling history (keep 6 verbatim; summarise overflow once) ────
+    _HIST_WINDOW = 6
+    if len(history) > _HIST_WINDOW:
+        older = history[:-_HIST_WINDOW]
+        recent = history[-_HIST_WINDOW:]
+        # Use a cached summary stored in _doc_store so it is computed once per
+        # session, not on every turn.
+        cached_summary = (
+            _doc_store[doc_id].get("_hist_summary", "")
+            if doc_id and doc_id in _doc_store
+            else ""
+        )
+        if not cached_summary:
+            try:
+                summary_prompt = (
+                    "Summarise the following conversation turns in one short paragraph:\n"
+                    + "\n".join(f"{h['role']}: {h['content']}" for h in older)
+                )
+                llm = get_chunk_llm()
+                raw = await loop.run_in_executor(None, llm.invoke, summary_prompt)
+                cached_summary = raw.content if hasattr(raw, "content") else str(raw)
+                if doc_id and doc_id in _doc_store:
+                    _doc_store[doc_id]["_hist_summary"] = cached_summary
+            except Exception:
+                cached_summary = ""
+        if cached_summary:
+            hist_messages = [
+                SystemMessage(content=f"Earlier conversation summary: {cached_summary}")
+            ]
+            hist_messages += _history_to_messages(recent)
+        else:
+            hist_messages = _history_to_messages(recent)
+    else:
+        hist_messages = _history_to_messages(history)
+
+    # ── STEP G: stream LLM + citation check ───────────────────────────────────
+    # Build role lookup from original chunks so IRAC slots can be injected
+    _role_map = {c["para_no"]: c.get("role", "") for c in chunks}
+    context_parts = []
+    for item in top5:
+        irac_slot = _ROLE_TO_IRAC.get(_role_map.get(item["para_no"], ""), "")
+        slot_prefix = f"[{irac_slot}] " if irac_slot else ""
+        context_parts.append(f"[Para {item['para_no']}] {slot_prefix}{item['body']}")
+    context = "\n\n".join(context_parts)
+    sources = [f"Para {item['para_no']}" for item in top5]
+    retrieved_ids = {item["para_no"] for item in top5}
+    chain = _get_rag_chain()
+
+    full_response: list = []
+    try:
+        async for tok in chain.astream(
+            {
+                "context": context,
+                "history": hist_messages,
+                "question": question,
+            }
+        ):
+            full_response.append(tok)
             yield f"data: {json.dumps({'token': tok, 'done': False})}\n\n"
         yield f"data: {json.dumps({'token': '', 'done': True, 'sources': sources})}\n\n"
+        response_text = "".join(full_response)
+        cited_ids = set(re.findall(r"\[Para ([^\]]+)\]", response_text))
+        yield (
+            f"data: {json.dumps({'citation_check': {'verified': list(cited_ids & retrieved_ids), 'hallucinated': list(cited_ids - retrieved_ids)}, 'done': True})}\n\n"
+        )
     except Exception as exc:
         yield f"data: {json.dumps({'token': f'[Chat error: {exc}]', 'done': True, 'sources': []})}\n\n"
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
+
 
 class ClassifyRequest(BaseModel):
     doc_id: str | None = None
@@ -1343,6 +1802,7 @@ class SimilarResponse(BaseModel):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+
 @app.post("/extract")
 async def extract_endpoint(file: UploadFile = File(...)):
     pdf_bytes = await file.read()
@@ -1354,7 +1814,13 @@ async def extract_endpoint(file: UploadFile = File(...)):
     meta_llm_fut = loop.run_in_executor(None, parse_metadata_llm, header_raw)
 
     footer_meta = parse_footer(footer_raw)
-    if not any([footer_meta["judges"], footer_meta["judgment_date"], footer_meta["judgment_location"]]):
+    if not any(
+        [
+            footer_meta["judges"],
+            footer_meta["judgment_date"],
+            footer_meta["judgment_location"],
+        ]
+    ):
         footer_meta = parse_footer(raw_md[-3000:])
 
     meta_regex["judges"] = footer_meta["judges"]
@@ -1377,7 +1843,8 @@ async def extract_endpoint(file: UploadFile = File(...)):
     doc_id = uuid.uuid4().hex
     _evict_if_needed()
     _doc_store[doc_id] = {
-        "chunks": chunks, "header": header_raw,
+        "chunks": chunks,
+        "header": header_raw,
         "footer": footer_raw,
         "metadata": meta,
         "metadata_regex": meta_regex,
@@ -1386,7 +1853,9 @@ async def extract_endpoint(file: UploadFile = File(...)):
         "raw_md_tail": raw_md[-3000:],
     }
 
-    def _eager_embed(did: str, ch: list, _loop: asyncio.AbstractEventLoop, _evt: asyncio.Event) -> None:
+    def _eager_embed(
+        did: str, ch: list, _loop: asyncio.AbstractEventLoop, _evt: asyncio.Event
+    ) -> None:
         if did in _embedding_cache:
             _loop.call_soon_threadsafe(_evt.set)
             return
@@ -1399,7 +1868,9 @@ async def extract_endpoint(file: UploadFile = File(...)):
 
     _loop = asyncio.get_running_loop()
     _embed_evt = _embed_events.setdefault(doc_id, asyncio.Event())
-    threading.Thread(target=_eager_embed, args=(doc_id, chunks, _loop, _embed_evt), daemon=True).start()
+    threading.Thread(
+        target=_eager_embed, args=(doc_id, chunks, _loop, _embed_evt), daemon=True
+    ).start()
 
     return {
         "doc_id": doc_id,
@@ -1442,7 +1913,6 @@ async def classify_endpoint(req: ClassifyRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     chunks = _resolve_chunks(req.doc_id, req.chunks)
@@ -1455,10 +1925,10 @@ async def chat_endpoint(req: ChatRequest):
 @app.post("/similar")
 async def similar_endpoint(
     file: UploadFile = File(...),
-    court:     str | None = Query(default=None),
+    court: str | None = Query(default=None),
     year_from: int | None = Query(default=None),
-    year_to:   int | None = Query(default=None),
-    act:       str | None = Query(default=None),
+    year_to: int | None = Query(default=None),
+    act: str | None = Query(default=None),
 ) -> SimilarResponse:
     from qdrant_client import models as qm  # noqa: PLC0415
 
@@ -1473,11 +1943,12 @@ async def similar_endpoint(
         loop.run_in_executor(None, _llm_extract, raw_text),
         loop.run_in_executor(None, _extract_legal_spans, raw_text),
     )
-    canon  = canonicalize_spans(spans)
+    canon = canonicalize_spans(spans)
     q_prov = set(canon["provisions_canon"])
     q_stat = set(canon["statutes_canon"])
     q_prec = set(canon["precedents_canon"])
     from backend.legal_normalizer import canonicalize_entity  # noqa: PLC0415
+
     for cp in extraction.provisions:
         q_prov.add(canonicalize_entity(cp.text, "PROVISION"))
     for cs in extraction.statutes:
@@ -1486,7 +1957,7 @@ async def similar_endpoint(
         q_prec.add(canonicalize_entity(cp.citation, "PRECEDENT"))
 
     # 4 — Three embeddings
-    embedder   = get_similar_embedder()
+    embedder = get_similar_embedder()
     ratio_text = " ".join(extraction.ratio_decidendi) or extraction.summary
     master_text = extraction.summary + " " + " ".join(extraction.ratio_decidendi)
     dense_ratio, dense_facts, dense_full = await asyncio.gather(
@@ -1500,21 +1971,27 @@ async def similar_endpoint(
     if court and court != "Any":
         must.append(qm.FieldCondition(key="court", match=qm.MatchValue(value=court)))
     if year_from or year_to:
-        must.append(qm.FieldCondition(
-            key="year",
-            range=qm.Range(gte=year_from, lte=year_to),
-        ))
+        must.append(
+            qm.FieldCondition(
+                key="year",
+                range=qm.Range(gte=year_from, lte=year_to),
+            )
+        )
     if act:
         from backend.legal_normalizer import canonicalize_entity  # noqa: PLC0415
+
         act_canon = canonicalize_entity(act, "STATUTE")
-        must.append(qm.FieldCondition(
-            key="statutes_canon", match=qm.MatchValue(value=act_canon)
-        ))
+        must.append(
+            qm.FieldCondition(
+                key="statutes_canon", match=qm.MatchValue(value=act_canon)
+            )
+        )
     qdrant_filter = qm.Filter(must=must) if must else None
 
     # 6 — BM25 keywords (for text-filtered dense prefetch)
     keywords = [
-        w for w in re.findall(r'\b[A-Za-z]{4,}\b', master_text[:2000])
+        w
+        for w in re.findall(r"\b[A-Za-z]{4,}\b", master_text[:2000])
         if w.lower() not in _BM25_STOPWORDS
     ]
     bm25_query = " ".join(dict.fromkeys(keywords))[:500]
@@ -1522,20 +1999,24 @@ async def similar_endpoint(
     prefetches = [
         qm.Prefetch(query=dense_ratio, using="dense_ratio", limit=20),
         qm.Prefetch(query=dense_facts, using="dense_facts", limit=20),
-        qm.Prefetch(query=dense_full,  using="dense_full",  limit=20),
+        qm.Prefetch(query=dense_full, using="dense_full", limit=20),
     ]
     if bm25_query:
-        prefetches.append(qm.Prefetch(
-            query=dense_full,
-            using="dense_full",
-            filter=qm.Filter(must=[
-                qm.FieldCondition(
-                    key="text_for_bm25",
-                    match=qm.MatchText(text=bm25_query),
-                )
-            ]),
-            limit=20,
-        ))
+        prefetches.append(
+            qm.Prefetch(
+                query=dense_full,
+                using="dense_full",
+                filter=qm.Filter(
+                    must=[
+                        qm.FieldCondition(
+                            key="text_for_bm25",
+                            match=qm.MatchText(text=bm25_query),
+                        )
+                    ]
+                ),
+                limit=20,
+            )
+        )
 
     # 7 — Hybrid RRF query → top-20 candidates
     try:
@@ -1553,8 +2034,13 @@ async def similar_endpoint(
         return SimilarResponse(
             query_summary=extraction.summary,
             query_ratio_decidendi=extraction.ratio_decidendi,
-            query_provisions=[{"text": p.text, "role": p.role} for p in extraction.provisions],
-            query_precedents=[{"citation": p.citation, "short_name": p.short_name, "role": p.role} for p in extraction.precedents],
+            query_provisions=[
+                {"text": p.text, "role": p.role} for p in extraction.provisions
+            ],
+            query_precedents=[
+                {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+                for p in extraction.precedents
+            ],
             query_statutes=extraction.statutes,
             results=[],
         )
@@ -1563,8 +2049,13 @@ async def similar_endpoint(
         return SimilarResponse(
             query_summary=extraction.summary,
             query_ratio_decidendi=extraction.ratio_decidendi,
-            query_provisions=[{"text": p.text, "role": p.role} for p in extraction.provisions],
-            query_precedents=[{"citation": p.citation, "short_name": p.short_name, "role": p.role} for p in extraction.precedents],
+            query_provisions=[
+                {"text": p.text, "role": p.role} for p in extraction.provisions
+            ],
+            query_precedents=[
+                {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+                for p in extraction.precedents
+            ],
             query_statutes=extraction.statutes,
             results=[],
         )
@@ -1609,9 +2100,9 @@ async def similar_endpoint(
     for hit, rerank_score in zip(rrf_hits, ce_scores):
         p = hit.payload or {}
 
-        doc_prov  = p.get("provisions_canon", [])
-        doc_stat  = p.get("statutes_canon",   [])
-        doc_prec  = p.get("precedents_canon", [])
+        doc_prov = p.get("provisions_canon", [])
+        doc_stat = p.get("statutes_canon", [])
+        doc_prec = p.get("precedents_canon", [])
 
         prov_j = _jaccard(q_prov, set(doc_prov))
         stat_j = _jaccard(q_stat, set(doc_stat))
@@ -1627,35 +2118,48 @@ async def similar_endpoint(
             + 0.08 * stat_j
         )
 
-        results.append(SimilarResult(
-            case_number=p.get("case_number", ""),
-            case_type=p.get("case_type", ""),
-            court=p.get("court", ""),
-            year=int(p.get("year", 0) or 0),
-            judge=p.get("judge", ""),
-            outcome=p.get("outcome", "unknown"),
-            summary=p.get("summary", ""),
-            ratio_decidendi=p.get("ratio_decidendi", []),
-            final_score=round(float(final), 4),
-            rerank_score=round(float(rerank_score), 4),
-            rrf_score=round(float(rrf_norm[hit.id]), 4),
-            semantic_score=round(semantic, 4),
-            precedent_score=round(prec_j, 4),
-            provision_score=round(prov_j, 4),
-            statute_score=round(stat_j, 4),
-            shared_precedents_raw=_shared_raw(q_prec, doc_prec, p.get("precedents_raw", [])),
-            shared_provisions_raw=_shared_raw(q_prov, doc_prov, p.get("provisions_raw", [])),
-            shared_statutes_raw=_shared_raw(q_stat, doc_stat, p.get("statutes_raw", [])),
-            provision_roles=p.get("provision_roles", {}),
-            precedent_roles=p.get("precedent_roles", {}),
-        ))
+        results.append(
+            SimilarResult(
+                case_number=p.get("case_number", ""),
+                case_type=p.get("case_type", ""),
+                court=p.get("court", ""),
+                year=int(p.get("year", 0) or 0),
+                judge=p.get("judge", ""),
+                outcome=p.get("outcome", "unknown"),
+                summary=p.get("summary", ""),
+                ratio_decidendi=p.get("ratio_decidendi", []),
+                final_score=round(float(final), 4),
+                rerank_score=round(float(rerank_score), 4),
+                rrf_score=round(float(rrf_norm[hit.id]), 4),
+                semantic_score=round(semantic, 4),
+                precedent_score=round(prec_j, 4),
+                provision_score=round(prov_j, 4),
+                statute_score=round(stat_j, 4),
+                shared_precedents_raw=_shared_raw(
+                    q_prec, doc_prec, p.get("precedents_raw", [])
+                ),
+                shared_provisions_raw=_shared_raw(
+                    q_prov, doc_prov, p.get("provisions_raw", [])
+                ),
+                shared_statutes_raw=_shared_raw(
+                    q_stat, doc_stat, p.get("statutes_raw", [])
+                ),
+                provision_roles=p.get("provision_roles", {}),
+                precedent_roles=p.get("precedent_roles", {}),
+            )
+        )
 
     results.sort(key=lambda r: r.final_score, reverse=True)
     return SimilarResponse(
         query_summary=extraction.summary,
         query_ratio_decidendi=extraction.ratio_decidendi,
-        query_provisions=[{"text": p.text, "role": p.role} for p in extraction.provisions],
-        query_precedents=[{"citation": p.citation, "short_name": p.short_name, "role": p.role} for p in extraction.precedents],
+        query_provisions=[
+            {"text": p.text, "role": p.role} for p in extraction.provisions
+        ],
+        query_precedents=[
+            {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+            for p in extraction.precedents
+        ],
         query_statutes=extraction.statutes,
         results=results[:5],
     )
@@ -1695,7 +2199,10 @@ async def debug_footer_endpoint(doc_id: str | None = None):
     else:
         return {"error": "no documents extracted yet"}
     return {
-        "footer_raw":   entry.get("footer", ""),
-        "raw_md_tail":  entry.get("raw_md_tail", ""),
-        "metadata":     {k: entry["metadata"].get(k) for k in ("judges", "judgment_date", "judgment_location", "judge")},
+        "footer_raw": entry.get("footer", ""),
+        "raw_md_tail": entry.get("raw_md_tail", ""),
+        "metadata": {
+            k: entry["metadata"].get(k)
+            for k in ("judges", "judgment_date", "judgment_location", "judge")
+        },
     }
