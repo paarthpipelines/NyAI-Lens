@@ -1,4 +1,6 @@
 import asyncio
+import concurrent.futures
+import contextlib
 import json
 import logging
 import numpy as np
@@ -9,8 +11,9 @@ import threading
 import time
 import uuid
 import warnings
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 from pathlib import Path
@@ -51,6 +54,29 @@ IndexBundle = namedtuple(
     "IndexBundle", ["faiss_index", "para_keys", "bm25", "tokenized"]
 )
 
+log = logging.getLogger(__name__)
+
+_AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=int(os.getenv("AGENT_CONCURRENCY", "8")),
+    thread_name_prefix="agent-llm",
+)
+
+_llm_registry_lock = threading.Lock()
+_shared_llms: dict[str, Any] = {}
+
+
+def _get_llm(model: str, temperature: float = 0, fmt: str | None = None, **extra_kwargs) -> "ChatOllama":
+    """Return a cached ChatOllama instance for the given model config."""
+    key = f"{model}:{temperature}:{fmt}:{tuple(sorted(extra_kwargs.items()))}"
+    if key not in _shared_llms:
+        with _llm_registry_lock:
+            if key not in _shared_llms:
+                kwargs: dict = {"model": model, "temperature": temperature, **extra_kwargs}
+                if fmt:
+                    kwargs["format"] = fmt
+                _shared_llms[key] = ChatOllama(**kwargs)
+    return _shared_llms[key]
+
 
 async def _warmup(loop: asyncio.AbstractEventLoop) -> None:
     await asyncio.gather(
@@ -81,14 +107,14 @@ app.add_middleware(
 # ── Model configs ──────────────────────────────────────────────────────────────
 # Override any model via env var: RHET_MODEL, RAG_LLM_MODEL, EMBED_MODEL
 _RHET_OLLAMA_MODEL = os.getenv("RHET_MODEL", "deepseek-v3.1:671b-cloud")
-_RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "gpt-oss:120b-cloud")
+_RAG_LLM_MODEL = os.getenv("RAG_LLM_MODEL", "deepseek-v3.1:671b-cloud")
 _RAG_EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 _SIMILAR_EMBED_MODEL = os.getenv(
     "EMBED_MODEL", "bge-m3"
 )  # 1024-dim; used for /similar and ingest
 _SIMILAR_EMBED_DIM = 1024
 _QDRANT_COLLECTION = "indian_judgements"
-_CHUNK_LLM_MODEL = os.getenv("CHUNK_LLM_MODEL", _RHET_OLLAMA_MODEL)
+_CHUNK_LLM_MODEL = os.getenv("CHUNK_LLM_MODEL", "deepseek-v3.1:671b-cloud")
 _EMBED_BATCH = 16
 
 # ── Page-number line detection ─────────────────────────────────────────────────
@@ -107,6 +133,15 @@ _JUDGMENT_LOCATION_RE = re.compile(
     r"\b(NEW\s+DELHI|MUMBAI|CHENNAI|KOLKATA|HYDERABAD|BENGALURU|BANGALORE)\b",
     re.IGNORECASE,
 )
+
+# ── BM25 tokeniser ────────────────────────────────────────────────────────────
+_LEGAL_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+(?:[-'][a-zA-Z0-9]+)*")
+
+
+def _legal_tokenize(text: str) -> list[str]:
+    """Lowercase tokeniser that preserves hyphenated legal terms and case names."""
+    return _LEGAL_TOKEN_RE.findall(text.lower())
+
 
 # ── Para-body line-joining helpers ─────────────────────────────────────────────
 _SENT_END_RE = re.compile(r"[.;:—–!?]\*{0,4}\s*$")
@@ -226,22 +261,34 @@ _RHET_CHAT_PROMPT = ChatPromptTemplate.from_messages(
 # ── RAG config ─────────────────────────────────────────────────────────────────
 _RAG_SYSTEM = (
     "You are a senior Indian Supreme Court legal analyst. "
-    "Answer using ONLY the judgment excerpts below. "
+    "Answer using ONLY the judgment excerpts provided below. "
     "Every factual claim must be cited inline as [Para N].\n\n"
-    "For simple factual questions (identity, date, parties), answer directly and concisely.\n\n"
-    "For legal analysis questions, structure your response as:\n"
-    "**Issue** — the legal question raised\n"
-    "**Rule** — the governing principle or statute\n"
-    "**Application** — how the rule applies to the facts [Para N]\n"
-    "**Conclusion** — the court's holding\n"
-    "**Caveats** — limitations, dissents, or open questions (omit if none)\n\n"
-    "Rules:\n"
-    "• If a section is unsupported by the excerpts, write "
-    "'Not addressed in provided excerpts.'\n"
+    "CHOOSE YOUR FORMAT based on the question type:\n\n"
+    "• Factual / identity question (who, when, which court, was X a party): "
+    "answer in one or two direct sentences. No headers.\n\n"
+    "• Single-issue legal question (was bail granted, was the appeal allowed, "
+    "what did the court hold on X): answer in a short flowing paragraph. "
+    "No headers. Cite paragraphs inline.\n\n"
+    "• Multi-issue legal analysis (what was the ratio, how did the court reason "
+    "through the competing arguments, explain the judgment): use IRAC structure. "
+    "Write each section as a prose paragraph under a bold label on its own line:\n"
+    "  **Issue**\n"
+    "  the legal question raised\n\n"
+    "  **Rule**\n"
+    "  the governing principle, provision, or precedent\n\n"
+    "  **Application**\n"
+    "  how the rule was applied to the facts [Para N]\n\n"
+    "  **Conclusion**\n"
+    "  the court's holding\n\n"
+    "  **Caveats**\n"
+    "  dissents, limitations, open questions — omit this section entirely if none\n\n"
+    "Rules that apply to all formats:\n"
+    "• Every factual claim must be cited as [Para N].\n"
+    "• If any aspect is unsupported by the excerpts, say so within the prose "
+    "('The excerpts do not address...'). Do not speculate.\n"
     "• Never invent citations, parties, dates, or outcomes.\n"
-    "• If the question cannot be answered from the excerpts, say so clearly "
-    "and do not speculate.\n\n"
-    "JUDGMENT EXCERPTS (each prefixed with its IRAC slot where known):\n{context}"
+    "• Begin directly with the answer — no preamble.\n\n"
+    "JUDGMENT EXCERPTS:\n{context}"
 )
 _RAG_PROMPT = ChatPromptTemplate.from_messages(
     [
@@ -257,36 +304,145 @@ _CLASSIFY_RETRIES = 2
 _CLASSIFY_CONCURRENCY = int(os.getenv("CLASSIFY_CONCURRENCY", "2"))
 _classify_semaphore = asyncio.Semaphore(_CLASSIFY_CONCURRENCY)
 
+# ── Agentic RAG constants ──────────────────────────────────────────────────────
+
+MAX_AGENT_ATTEMPTS = 4
+
+_AGENT_SYSTEM = """\
+You are a senior Indian Supreme Court legal analyst with access to five tools.
+Use the minimum tools necessary to answer the question accurately.
+
+TOOL SELECTION RULES:
+- get_metadata       → parties, citation, court, date, reportable status, authoring judge
+- get_summary        → case overview, ratio decidendi list, final outcome
+- get_precedents     → cited cases, provisions, statutes cited
+- get_rhetorical_map → argument structure, who argued what, paragraph role map
+- retrieve_paragraphs → verbatim paragraph text, specific holdings, detailed reasoning
+
+EFFICIENCY RULES:
+1. Start with the cheapest tool that could answer the question.
+2. Call get_metadata FIRST for any identity or procedural question.
+3. Call get_summary BEFORE retrieve_paragraphs for overview questions.
+4. Only call retrieve_paragraphs if the above tools leave gaps.
+5. You MAY call multiple tools in a single turn if the question clearly needs them.
+6. Once you have sufficient context, emit your final answer — do NOT call more tools.
+
+ANSWER FORMAT — choose based on the question:
+
+Factual / identity (who, when, which court, was X a party):
+  One or two sentences. No headers. Direct.
+
+Single-issue legal (was bail granted, what did the court hold on X):
+  Short flowing paragraph. No headers. Cite [Para N] inline.
+
+Multi-issue legal analysis (ratio decidendi, full reasoning, competing arguments):
+  IRAC structure. Each section is a prose paragraph under a bold label on its own line:
+
+  **Issue**
+  the legal question raised
+
+  **Rule**
+  governing principle, provision, or precedent [Para N]
+
+  **Application**
+  how the rule applies to these facts [Para N]
+
+  **Conclusion**
+  the court's holding
+
+  **Caveats**
+  dissents or open questions — omit this section entirely if none
+
+Every factual claim from retrieved paragraphs MUST be cited as [Para N].
+Begin directly with the answer. No preamble. Never invent facts.
+
+Respond with ONLY valid JSON (no markdown fences):
+To call tools: {"action":"tool_call","tools":[{"tool":"<name>","args":{...}}, ...]}
+To answer:     {"action":"answer","content":"<your answer — prose or IRAC as appropriate>"}
+"""
+
+_TOOLS_DESCRIPTION = """\
+Available tools:
+1. get_metadata(doc_id)                                              → case identity
+2. get_summary(doc_id)                                               → summary, ratio, outcome
+3. get_precedents(doc_id)                                            → cited cases/provisions/statutes
+4. get_rhetorical_map(doc_id)                                        → para roles/voices (no full text)
+5. retrieve_paragraphs(doc_id, query, k=5, role_filter=null)         → dense+BM25 reranked paras"""
+
+
+@dataclass
+class CriticResult:
+    passed: bool
+    score: float
+    hallucinated_cites: list
+    unsupported_claims: list
+    coverage_gaps: list
+    feedback: str
+
+
+def _get_agent_llm() -> "ChatOllama":
+    return _get_llm(_RAG_LLM_MODEL, fmt="json")
+
+
 # ── Extraction (for /similar and ingest) ───────────────────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a senior Indian legal analyst. Given the text of a court judgment, "
-    "extract the following six fields:\n\n"
-    "1. summary: A 3-5 sentence summary covering who the parties are, the core legal "
-    "dispute, the procedural history, and the final decision.\n\n"
-    "2. ratio_decidendi: A list of 2-6 sentences, each capturing one distinct legal "
-    "principle or holding laid down by this judgment that carries precedential weight. "
-    "Be precise; cite specific sections/articles where relevant.\n\n"
-    "3. outcome: Exactly one of: allowed, dismissed, remanded, affirmed, partly allowed, "
-    "quashed, set aside, unknown.\n\n"
-    "4. provisions: A list of statutory provisions cited, each as "
-    '{"text": "Section 302 IPC", "role": "decisive"}. '
-    "Role must be one of: decisive, supporting, background, distinguished.\n\n"
-    "5. precedents: A list of case citations relied upon, each as "
-    '{"citation": "AIR 1961 SC 1808", "short_name": "Kehar Singh v State", "role": "relied_upon"}. '
-    "Role must be one of: relied_upon, followed, distinguished, overruled, merely_cited.\n\n"
-    '6. statutes: A list of bare statute names cited (e.g. "Indian Penal Code", "CrPC").\n\n'
-    "Respond with ONLY valid JSON — no markdown fences, no explanation:\n"
+    "You are extracting structured metadata from Indian legal judgments.\n\n"
+    "Focus on HIGH-QUALITY LEGAL SUMMARIZATION and CLEAN NORMALIZATION.\n"
+    "Do NOT over-structure the output. Keep the schema lightweight and retrieval-friendly.\n\n"
+    "Respond with ONLY valid JSON — no markdown fences, no explanation:\n\n"
     '{"summary": "...", "ratio_decidendi": ["..."], "outcome": "...", '
     '"provisions": [{"text": "...", "role": "..."}], '
-    '"precedents": [{"citation": "...", "short_name": "...", "role": "..."}], '
-    '"statutes": ["..."]}'
+    '"precedents": [{"citation": "...", "case_title": "...", "role": "..."}], '
+    '"statutes": ["..."]}\n\n'
+    "INSTRUCTIONS:\n\n"
+    "summary: A 3-5 sentence summary covering the parties, core legal dispute, "
+    "procedural history, key principles applied, and the final decision.\n\n"
+    "ratio_decidendi: 2-6 concise doctrinal principles actually applied by the court. "
+    "Do not repeat the summary. Cite specific sections/articles where relevant.\n\n"
+    "outcome: Exactly one of: allowed, dismissed, partly_allowed, remanded, affirmed, "
+    "quashed, set aside, disposed, unknown.\n\n"
+    "provisions: Every section/article/rule applied or discussed. "
+    'Role must be one of: decisive, supporting, background, distinguished.\n\n'
+    "precedents: Every case citation. Merge case_title and citation into one object. "
+    "case_title format: 'Party v. Party' (normalize Vs./vs/versus to v.). "
+    "Remove footnote markers, trailing digits, OCR artifacts. "
+    "Role must be one of: relied_upon, followed, distinguished, overruled, merely_cited.\n\n"
+    'statutes: Bare statute names cited (e.g. "Indian Penal Code, 1860", "CrPC").'
 )
 # SystemMessage (not tuple) prevents ChatPromptTemplate from treating the JSON
 # examples inside SYSTEM_PROMPT as template variables.
 _EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
     [
         SystemMessage(content=SYSTEM_PROMPT),
+        ("human", "{text}"),
+    ]
+)
+
+# Lighter prompt used only by /similar — shorter summary caps output tokens so
+# the query-side LLM call finishes quickly (the full headnote is not needed for
+# embedding quality or Jaccard scoring).
+_SIMILAR_SYSTEM_PROMPT = (
+    "You are extracting structured metadata from Indian legal judgments.\n\n"
+    "Respond with ONLY valid JSON — no markdown fences, no explanation:\n\n"
+    '{"summary": "...", "ratio_decidendi": ["..."], "outcome": "...", '
+    '"provisions": [{"text": "...", "role": "..."}], '
+    '"precedents": [{"citation": "...", "case_title": "...", "role": "..."}], '
+    '"statutes": ["..."]}\n\n'
+    "INSTRUCTIONS:\n\n"
+    "summary: 2-3 sentences max. Core legal issue and final holding only.\n\n"
+    "ratio_decidendi: 1-3 key doctrinal principles applied by the court.\n\n"
+    "outcome: Exactly one of: allowed, dismissed, partly_allowed, remanded, affirmed, "
+    "quashed, set aside, disposed, unknown.\n\n"
+    "provisions: Every section/article/rule applied or discussed. "
+    'Role must be one of: decisive, supporting, background, distinguished.\n\n'
+    "precedents: Every case citation. case_title format: 'Party v. Party'. "
+    "Role must be one of: relied_upon, followed, distinguished, overruled, merely_cited.\n\n"
+    'statutes: Bare statute names cited (e.g. "Indian Penal Code, 1860", "CrPC").'
+)
+_SIMILAR_EXTRACT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        SystemMessage(content=_SIMILAR_SYSTEM_PROMPT),
         ("human", "{text}"),
     ]
 )
@@ -299,7 +455,7 @@ class CasedProvision(BaseModel):
 
 class CasedPrecedent(BaseModel):
     citation: str
-    short_name: str
+    case_title: str
     role: str  # relied_upon | followed | distinguished | overruled | merely_cited
 
 
@@ -339,7 +495,7 @@ def _parse_extraction(raw: str) -> Extraction:
                 for p in data.get("precedents", [])
                 if isinstance(p, dict)
                 and "citation" in p
-                and "short_name" in p
+                and "case_title" in p
                 and "role" in p
             ],
             statutes=[str(s) for s in data.get("statutes", [])],
@@ -375,6 +531,11 @@ def _extract_plain_text(pdf_bytes: bytes, max_chars: int = 15_000) -> str:
 
 def _llm_extract(text: str) -> Extraction:
     return _parse_extraction(_get_extract_chain().invoke({"text": text}))
+
+
+def _llm_extract_query(text: str) -> Extraction:
+    """Like _llm_extract but uses the shorter query-side prompt for /similar speed."""
+    return _parse_extraction(_get_similar_extract_chain().invoke({"text": text}))
 
 
 # ── Similarity helpers ─────────────────────────────────────────────────────────
@@ -462,40 +623,24 @@ _rhet_chain: Any = None
 async def get_rhet_chain_async():
     global _rhet_chain
     if _rhet_chain is None:
-        llm = ChatOllama(model=_RHET_OLLAMA_MODEL)
-        _rhet_chain = _RHET_CHAT_PROMPT | llm | StrOutputParser()
+        _rhet_chain = _RHET_CHAT_PROMPT | _get_llm(_RHET_OLLAMA_MODEL, num_predict=200) | StrOutputParser()
     return _rhet_chain
 
 
-_chunk_llm_local = threading.local()
-
-
 def get_chunk_llm() -> ChatOllama:
-    if not hasattr(_chunk_llm_local, "llm"):
-        _chunk_llm_local.llm = ChatOllama(model=_CHUNK_LLM_MODEL, temperature=0)
-    return _chunk_llm_local.llm
-
-
-_extract_chain_local = threading.local()
+    return _get_llm(_CHUNK_LLM_MODEL)
 
 
 def _get_extract_chain():
-    if not hasattr(_extract_chain_local, "chain"):
-        _extract_chain_local.chain = (
-            _EXTRACT_PROMPT | ChatOllama(model=_RAG_LLM_MODEL) | StrOutputParser()
-        )
-    return _extract_chain_local.chain
+    return _EXTRACT_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
 
 
-_rag_chain_local = threading.local()
+def _get_similar_extract_chain():
+    return _SIMILAR_EXTRACT_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
 
 
 def _get_rag_chain():
-    if not hasattr(_rag_chain_local, "chain"):
-        _rag_chain_local.chain = (
-            _RAG_PROMPT | ChatOllama(model=_RAG_LLM_MODEL) | StrOutputParser()
-        )
-    return _rag_chain_local.chain
+    return _RAG_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
 
 
 @lru_cache(maxsize=1)
@@ -521,14 +666,14 @@ def get_qdrant():
         raise RuntimeError(
             "QDRANT_URL is not set. Add it to backend/.env — see .env.example."
         )
-    api_key = os.getenv("QDRANT_API_KEY")
-    if not api_key:
+    api_key  = os.getenv("QDRANT_API_KEY")
+    is_local = url.startswith(("http://localhost", "http://127."))
+    if not api_key and not is_local:
         logging.warning(
             "QDRANT_API_KEY is not set — attempting unauthenticated connection. "
             "Set QDRANT_API_KEY in backend/.env for Qdrant Cloud."
         )
-        return QdrantClient(url=url, timeout=60)
-    return QdrantClient(url=url, api_key=api_key, timeout=60)
+    return QdrantClient(url=url, api_key=api_key or None, timeout=60)
 
 
 @lru_cache(maxsize=1)
@@ -537,24 +682,25 @@ def get_similar_embedder():
 
 
 # ── Server-side document & embedding stores ────────────────────────────────────
-_doc_store: dict[str, dict] = {}  # doc_id → extracted document data
+_doc_store: OrderedDict = OrderedDict()  # doc_id → extracted document data (LRU order)
 _embedding_cache: dict[str, IndexBundle] = {}  # doc_id → IndexBundle
 _embed_events: dict[str, asyncio.Event] = {}  # doc_id → Event set when index is ready
+_store_lock = threading.RLock()  # guards all writes to _doc_store and _embedding_cache
 
 
 def _evict_if_needed() -> None:
-    """Evict the oldest entry from _doc_store and _embedding_cache when over limit.
-    Called before inserting a new document to bound memory usage."""
-    while len(_doc_store) >= _DOC_STORE_MAX:
-        oldest_key = next(iter(_doc_store))
-        _doc_store.pop(oldest_key, None)
-        _embedding_cache.pop(oldest_key, None)
-        _embed_events.pop(oldest_key, None)
-        logging.info(
-            "Evicted doc_store entry %s (cache limit %d reached)",
-            oldest_key,
-            _DOC_STORE_MAX,
-        )
+    """Evict the LRU entry from _doc_store and _embedding_cache when over limit."""
+    with _store_lock:
+        while len(_doc_store) >= _DOC_STORE_MAX:
+            oldest_key = next(iter(_doc_store))
+            _doc_store.pop(oldest_key, None)
+            _embedding_cache.pop(oldest_key, None)
+            _embed_events.pop(oldest_key, None)
+            logging.info(
+                "Evicted doc_store entry %s (cache limit %d reached)",
+                oldest_key,
+                _DOC_STORE_MAX,
+            )
 
 
 # ── Page-number helpers: imported from backend.text_utils ─────────────────────
@@ -1292,13 +1438,23 @@ def _safe_bodies(chunks):
     return [c["body"].strip() or "empty paragraph" for c in chunks]
 
 
+def _clean_for_embed(body: str) -> str:
+    """Strip markdown artifacts before embedding; keeps original body for display."""
+    text = re.sub(r"\*+", "", body)
+    text = re.sub(r"^#{1,4}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\[\d+\]", "", text)
+    text = re.sub(r"_([^_]+)_", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
 def _build_index(chunks: list) -> IndexBundle:
     embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
     para_keys = [c["para_no"] for c in chunks]
-    bodies = _safe_bodies(chunks)
+    bodies = [_clean_for_embed(c["body"].strip()) or "empty paragraph" for c in chunks]
     from rank_bm25 import BM25Okapi
 
-    tokenized = [b.lower().split() for b in bodies]
+    tokenized = [_legal_tokenize(b) for b in bodies]
     bm25 = BM25Okapi(tokenized)
     raw_vecs: list = []
     for i in range(0, len(bodies), _EMBED_BATCH):
@@ -1310,7 +1466,8 @@ def _build_index(chunks: list) -> IndexBundle:
                 try:
                     raw_vecs.append(embedder.embed_query(body))
                 except Exception:
-                    raw_vecs.append([0.0] * _SIMILAR_EMBED_DIM)
+                    logging.debug("_build_index: embed failed for chunk, using uniform fallback")
+                    raw_vecs.append([1.0 / _SIMILAR_EMBED_DIM ** 0.5] * _SIMILAR_EMBED_DIM)
     vecs = np.array(raw_vecs, dtype=np.float32)
 
     # ── Guard: sanitize NaN/Inf values before normalising ─────────────────────
@@ -1400,7 +1557,7 @@ def _history_to_messages(history: list[dict]) -> list:
 
 
 def _bm25_retrieve(question, chunks, bundle, top_k=20):
-    scores = bundle.bm25.get_scores(question.lower().split())
+    scores = bundle.bm25.get_scores(_legal_tokenize(question))
     idxs = scores.argsort()[::-1][:top_k]
     bm = {c["para_no"]: c["body"] for c in chunks}
     return [
@@ -1439,6 +1596,31 @@ def _section_retrieve(question, chunks):
     return out
 
 
+_QUERY_REWRITE_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a legal retrieval specialist for Indian Supreme Court judgments.\n"
+     "Rewrite the user question into 2-3 dense retrieval queries that match the "
+     "exact phrasing found in Indian judgment text (e.g. 'the court held', "
+     "'ratio decidendi', 'the appellant contended').\n"
+     "Return ONLY valid JSON: {{\"queries\": [\"...\", \"...\", \"...\"]}}"),
+    ("human", "{question}"),
+])
+
+
+async def _rewrite_query(question: str) -> list[str]:
+    """Expand a user question into 2-3 legal-language retrieval queries."""
+    loop = asyncio.get_running_loop()
+    chain = _QUERY_REWRITE_PROMPT | get_chunk_llm() | StrOutputParser() | _STRIP_THINK | _STRIP_FENCES
+    try:
+        raw = await loop.run_in_executor(None, chain.invoke, {"question": question})
+        data = json.loads(raw)
+        queries = [q for q in data.get("queries", []) if isinstance(q, str) and q.strip()]
+        return queries if queries else [question]
+    except Exception as exc:
+        log.warning("_rewrite_query failed: %s", exc)
+        return [question]
+
+
 def _rrf_fuse(lists, k=60):
     scores, bodies, sources = {}, {}, {}
     for lst in lists:
@@ -1457,58 +1639,597 @@ def _rrf_fuse(lists, k=60):
     )
 
 
+# ── Agent tools (five zero-latency reads + one retrieval tool) ─────────────────
+
+
+async def get_metadata(doc_id: str) -> dict:
+    """Return case identity fields already stored at /extract time."""
+    entry = _doc_store.get(doc_id, {})
+    with _store_lock:
+        if doc_id in _doc_store:
+            _doc_store.move_to_end(doc_id)
+    return entry.get("metadata", {})
+
+
+async def get_summary(doc_id: str) -> dict:
+    """Return LLM-generated summary, ratio decidendi list, and outcome."""
+    entry = _doc_store.get(doc_id, {})
+    with _store_lock:
+        if doc_id in _doc_store:
+            _doc_store.move_to_end(doc_id)
+    return {
+        "summary":         entry.get("summary", ""),
+        "ratio_decidendi": entry.get("ratio_decidendi", []),
+        "outcome":         entry.get("outcome", "unknown"),
+    }
+
+
+async def get_precedents(doc_id: str) -> dict:
+    """Return cited cases, provisions, and statutes extracted at /extract time."""
+    entry = _doc_store.get(doc_id, {})
+    with _store_lock:
+        if doc_id in _doc_store:
+            _doc_store.move_to_end(doc_id)
+    return {
+        "precedents": entry.get("precedents", []),
+        "provisions": entry.get("provisions", []),
+        "statutes":   entry.get("statutes", []),
+    }
+
+
+async def get_rhetorical_map(doc_id: str) -> list:
+    """Return compact paragraph role/voice/IRAC map (no full bodies)."""
+    entry = _doc_store.get(doc_id, {})
+    with _store_lock:
+        if doc_id in _doc_store:
+            _doc_store.move_to_end(doc_id)
+    chunks = entry.get("chunks", [])
+    return [
+        {
+            "para_no":   c["para_no"],
+            "role":      c.get("role", ""),
+            "voice":     c.get("voice", ""),
+            "irac_slot": _ROLE_TO_IRAC.get(c.get("role", ""), ""),
+        }
+        for c in chunks if c.get("role")
+    ]
+
+
+async def retrieve_paragraphs(
+    doc_id: str,
+    query: str,
+    chunks: list,
+    index_bundle: Any,
+    k: int = 5,
+    role_filter: list | None = None,
+) -> list:
+    """Dense + BM25 retrieval with RRF fusion, context expansion, cross-encoder reranking."""
+    if index_bundle is None:
+        log.warning("retrieve_paragraphs: index_bundle is None for doc_id=%s — returning empty", doc_id)
+        return []
+    loop = asyncio.get_running_loop()
+
+    working_chunks = chunks
+    filtered_bundle = index_bundle
+    if role_filter:
+        filtered = [c for c in chunks if c.get("role") in role_filter]
+        if filtered:
+            working_chunks = filtered
+            try:
+                filtered_bundle = await loop.run_in_executor(None, _build_index, working_chunks)
+            except Exception as exc:
+                logging.warning("retrieve_paragraphs: filtered index build failed: %s", exc)
+                working_chunks = chunks
+                filtered_bundle = index_bundle
+
+    bm25_results = await loop.run_in_executor(
+        None, _bm25_retrieve, query, working_chunks, filtered_bundle, 20
+    )
+
+    embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
+    dense_results: list = []
+    try:
+        q_vec_raw = await loop.run_in_executor(None, embedder.embed_query, query[:1800])
+        q_vec = np.array([q_vec_raw], dtype=np.float32)
+        q_vec = np.nan_to_num(q_vec, nan=0.0, posinf=0.0, neginf=0.0)
+        if np.linalg.norm(q_vec) == 0.0:
+            q_vec[0] = 1.0 / np.sqrt(q_vec.shape[1])
+        faiss.normalize_L2(q_vec)
+        fi = filtered_bundle.faiss_index
+        pk = filtered_bundle.para_keys
+        _, idxs = fi.search(q_vec, min(20, len(pk)))
+        bm = {c["para_no"]: c["body"] for c in working_chunks}
+        dense_results = [
+            {
+                "para_no": pk[i],
+                "body":    bm[pk[i]],
+                "score":   1.0 - rank * 0.05,
+                "source":  "dense",
+            }
+            for rank, i in enumerate(idxs[0])
+            if i >= 0 and pk[i] in bm
+        ]
+    except Exception as exc:
+        logging.warning("retrieve_paragraphs dense failed: %s", exc)
+
+    section_results = _section_retrieve(query, working_chunks)
+    fused = _rrf_fuse([bm25_results, dense_results, section_results])
+    para_map = {c["para_no"]: c for c in working_chunks}
+    present = {item["para_no"] for item in fused}
+    expansions: list = []
+    for item in fused[:20]:
+        c = para_map.get(item["para_no"], {})
+        for nb_key in ("prev_para_no", "next_para_no"):
+            nb_pn = c.get(nb_key)
+            if nb_pn and nb_pn not in present and nb_pn in para_map:
+                expansions.append({
+                    "para_no": nb_pn,
+                    "body":    para_map[nb_pn]["body"],
+                    "score":   item["score"] * 0.7,
+                    "source":  "context_expansion",
+                })
+                present.add(nb_pn)
+
+    candidates = fused + expansions
+    clean_map = {c["para_no"]: _clean_for_embed(c["body"]) for c in working_chunks}
+    display_map = {c["para_no"]: c["body"] for c in working_chunks}
+    try:
+        cross_enc = get_cross_encoder()
+        pairs = [(query, clean_map.get(item["para_no"], item["body"])) for item in candidates]
+        ce_scores_raw = await loop.run_in_executor(None, cross_enc.predict, pairs)
+        ce_arr = np.array(ce_scores_raw, dtype=np.float32)
+        sigmoid_scores = (1.0 / (1.0 + np.exp(-ce_arr))).tolist()
+        for item, s in zip(candidates, sigmoid_scores):
+            item["score"] = float(s)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+    except Exception as exc:
+        logging.warning("retrieve_paragraphs rerank failed: %s", exc)
+
+    role_map = {c["para_no"]: c.get("role", "") for c in working_chunks}
+    return [
+        {
+            "para_no":   item["para_no"],
+            "body":      display_map.get(item["para_no"], item["body"]),
+            "role":      role_map.get(item["para_no"], ""),
+            "irac_slot": _ROLE_TO_IRAC.get(role_map.get(item["para_no"], ""), ""),
+            "score":     item["score"],
+        }
+        for item in candidates[:k]
+    ]
+
+
+# ── Agent helpers ──────────────────────────────────────────────────────────────
+
+
+def _build_history_window(history: list[dict], token_budget: int = 2000) -> list:
+    """Return recent history as LangChain messages within rough token budget."""
+    msgs: list[dict] = []
+    budget = token_budget * 4  # rough chars-per-token estimate
+    for h in reversed(history):
+        budget -= len(h.get("content", ""))
+        if budget < 0:
+            break
+        msgs.insert(0, h)
+    return _history_to_messages(msgs)
+
+
+def _build_agent_input(
+    question: str,
+    hist_messages: list,
+    accumulated_context: list,
+) -> str:
+    """Assemble the full prompt string for one agent LLM turn."""
+    parts = [_AGENT_SYSTEM, _TOOLS_DESCRIPTION]
+
+    if hist_messages:
+        parts.append("\nCONVERSATION HISTORY:")
+        for msg in hist_messages:
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            content = msg.content[:500] + "..." if len(msg.content) > 500 else msg.content
+            parts.append(f"{role}: {content}")
+
+    if accumulated_context:
+        parts.append("\nACCUMULATED TOOL RESULTS:")
+        for ctx in accumulated_context:
+            tool = ctx["tool"]
+            result = ctx["result"]
+            if tool == "critic":
+                parts.append(f"\n[CRITIC FEEDBACK]\n{result}")
+            elif tool == "retrieve_paragraphs" and isinstance(result, list):
+                para_lines = []
+                for r in result[:8]:
+                    irac = f"[{r.get('irac_slot', '')}] " if r.get("irac_slot") else ""
+                    para_lines.append(f"[Para {r['para_no']}] {irac}{r['body'][:400]}")
+                parts.append("\n[RETRIEVED PARAGRAPHS]\n" + "\n\n".join(para_lines))
+            else:
+                result_str = json.dumps(result, indent=2)
+                if len(result_str) > 800:
+                    result_str = result_str[:800] + "\n[... truncated]"
+                parts.append(f"\n[{tool.upper()} RESULT]\n{result_str}")
+
+    parts.append(f"\nQUESTION: {question}")
+    parts.append("\nRespond with ONLY valid JSON as specified.")
+    return "\n".join(parts)
+
+
+async def _call_agent_llm(prompt: str, request_id: str = "") -> dict:
+    """Non-streaming agent LLM call. Returns parsed {action, tools/content}."""
+    loop = asyncio.get_running_loop()
+    llm = _get_agent_llm()
+    try:
+        raw = await loop.run_in_executor(_AGENT_EXECUTOR, llm.invoke, prompt)
+        text = raw.content if hasattr(raw, "content") else str(raw)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
+        return json.loads(text)
+    except Exception as exc:
+        log.warning("[%s] _call_agent_llm failed: %s", request_id, exc)
+        return {"action": "answer", "content": "[Agent error — please try again]"}
+
+
+async def _llm_with_heartbeat(
+    prompt: str,
+    heartbeat_queue: asyncio.Queue,
+    interval: float = 15.0,
+    request_id: str = "",
+) -> dict:
+    """Run _call_agent_llm while a background task queues keep-alive sentinels."""
+    async def _tick():
+        while True:
+            await asyncio.sleep(interval)
+            await heartbeat_queue.put(None)
+
+    tick_task = asyncio.create_task(_tick())
+    try:
+        return await _call_agent_llm(prompt, request_id=request_id)
+    finally:
+        tick_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await tick_task
+
+
+def _summarise_tool_result(tool_name: str, result: Any) -> str:
+    """Short human-readable summary of a tool result for the tools_used footer."""
+    try:
+        if tool_name == "get_metadata":
+            if isinstance(result, dict):
+                title = result.get("case_title") or result.get("citation") or ""
+                return f"case identity — {title}" if title else "case identity"
+        if tool_name == "get_summary":
+            if isinstance(result, dict):
+                outcome = result.get("outcome", "")
+                return f"summary · outcome: {outcome}" if outcome else "summary"
+        if tool_name == "get_precedents":
+            if isinstance(result, dict):
+                n = len(result.get("precedents", []))
+                return f"{n} precedent(s) retrieved"
+        if tool_name == "get_rhetorical_map":
+            if isinstance(result, list):
+                return f"{len(result)} paragraph role(s) mapped"
+        if tool_name == "retrieve_paragraphs":
+            if isinstance(result, list):
+                paras = ", ".join(
+                    r["para_no"] for r in result if isinstance(r, dict) and "para_no" in r
+                )
+                return f"paras {paras}" if paras else f"{len(result)} paragraph(s)"
+    except Exception:
+        pass
+    return ""
+
+
+async def _execute_tool(
+    tc: dict,
+    doc_id: str | None,
+    chunks: list,
+    index_bundle: Any,
+    question: str,
+    request_id: str = "",
+) -> Any:
+    """Dispatch a tool-call dict to the corresponding async function."""
+    name = tc.get("tool", "")
+    args = tc.get("args", {})
+    effective_doc_id = args.get("doc_id", doc_id) or doc_id or ""
+
+    try:
+        if name == "get_metadata":
+            return await get_metadata(effective_doc_id)
+        elif name == "get_summary":
+            return await get_summary(effective_doc_id)
+        elif name == "get_precedents":
+            return await get_precedents(effective_doc_id)
+        elif name == "get_rhetorical_map":
+            return await get_rhetorical_map(effective_doc_id)
+        elif name == "retrieve_paragraphs":
+            return await retrieve_paragraphs(
+                doc_id=effective_doc_id,
+                query=args.get("query", question),
+                chunks=chunks,
+                index_bundle=index_bundle,
+                k=int(args.get("k", 5)),
+                role_filter=args.get("role_filter"),
+            )
+        else:
+            return {"error": f"Unknown tool: {name}"}
+    except Exception as exc:
+        log.warning("[%s] _execute_tool %s failed: %s", request_id, name, exc)
+        return {"error": str(exc)}
+
+
+def _simulate_stream_chunks(text: str, chunk_size: int = 30):
+    """Yield text in fixed-size chunks to simulate streaming."""
+    for i in range(0, len(text), chunk_size):
+        yield text[i : i + chunk_size]
+
+
+# ── Corrective critic ──────────────────────────────────────────────────────────
+
+
+async def _run_critic(
+    question: str,
+    draft: str,
+    retrieved_ids: set,
+    chunks: list,
+    doc_id: str | None,
+    request_id: str = "",
+) -> CriticResult:
+    loop = asyncio.get_running_loop()
+
+    # Check 1 — Grounding (no LLM needed)
+    all_cited = set(re.findall(r"\[Para ([^\]]+)\]", draft))
+    good_cited = all_cited & retrieved_ids
+    grounding_score = len(good_cited) / max(len(all_cited), 1)
+    hallucinated_cites = list(all_cited - retrieved_ids)
+
+    para_body_map = {c["para_no"]: c["body"] for c in chunks}
+
+    # Check 2 — Faithfulness (fast heuristic, no LLM per sentence)
+    sentences_with_cites = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", draft)
+        if re.search(r"\[Para \d+\]", s)
+    ]
+
+    def _fast_faithfulness(sentence: str, para_text: str) -> bool:
+        words = set(re.findall(r"\b[A-Za-z]{5,}\b", sentence.lower()))
+        para_words = set(re.findall(r"\b[A-Za-z]{5,}\b", para_text.lower()))
+        return len(words & para_words) >= 2
+
+    unsupported = []
+    for s in sentences_with_cites:
+        cite_ids = re.findall(r"\[Para ([^\]]+)\]", s)
+        para_text = " ".join(para_body_map.get(pid, "") for pid in cite_ids)[:1500]
+        if para_text and not _fast_faithfulness(s, para_text):
+            unsupported.append(s)
+    faithfulness_score = 1.0 - (len(unsupported) / max(len(sentences_with_cites), 1))
+
+    # Check 3 — Relevance (small LLM, one call)
+    async def _check_relevance() -> tuple:
+        prompt = (
+            'Does this answer directly address the question using Indian court judgment facts? Reply JSON only: {"relevant": bool, "gaps": [str]}\n'
+            f"Question: {question}\nAnswer: {draft[:2000]}"
+        )
+        try:
+            llm = get_chunk_llm()
+            raw = await loop.run_in_executor(_AGENT_EXECUTOR, llm.invoke, prompt)
+            text = raw.content if hasattr(raw, "content") else str(raw)
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            text = re.sub(r"^```[a-z]*\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
+            data = json.loads(text)
+            return bool(data.get("relevant", True)), data.get("gaps", [])
+        except Exception:
+            log.warning("[%s] _run_critic relevance check failed", request_id)
+            return True, []
+
+    _, (relevant, gaps) = await asyncio.gather(
+        asyncio.sleep(0),
+        _check_relevance(),
+    )
+
+    relevance_score = 1.0 if relevant else 0.3
+    composite = 0.4 * grounding_score + 0.4 * faithfulness_score + 0.2 * relevance_score
+
+    feedback_lines: list[str] = []
+    if hallucinated_cites:
+        feedback_lines.append(f"Hallucinated citations: {hallucinated_cites}")
+    if unsupported:
+        feedback_lines.append(f"Unsupported claims: {unsupported[:3]}")
+    if not relevant and gaps:
+        feedback_lines.append(f"Coverage gaps: {gaps}")
+    if feedback_lines:
+        feedback_lines.append(
+            "Please call the appropriate tools to fill these gaps before answering again."
+        )
+
+    return CriticResult(
+        passed=composite >= 0.85,
+        score=round(composite, 3),
+        hallucinated_cites=hallucinated_cites,
+        unsupported_claims=unsupported,
+        coverage_gaps=gaps if not relevant else [],
+        feedback="\n".join(feedback_lines),
+    )
+
+
+_PLANNER_SYSTEM = """\
+You are a routing assistant for a legal judgment Q&A chatbot.
+Decide which document tools (if any) are needed to answer the user's latest message.
+
+DOCUMENT TOOLS:
+1. get_metadata(doc_id)
+   Use for: parties, citation, court name, case number, judges, date, location.
+   E.g. "Who filed this case?", "Which court decided this?", "What is the citation?"
+
+2. get_summary(doc_id)
+   Use for: case overview, what was decided, ratio decidendi, outcome.
+   E.g. "Summarise the case", "What did the court hold?", "What was the outcome?"
+
+3. get_precedents(doc_id)
+   Use for: cases cited, statutes or provisions applied.
+   E.g. "What cases were cited?", "Which sections of the IPC apply?"
+
+4. get_rhetorical_map(doc_id)
+   Use for: structural overview — which paragraphs cover which issue.
+   E.g. "Where does the judgment discuss the ratio?", "What parts cover the facts?"
+
+5. retrieve_paragraphs(doc_id, query, k=5, role_filter=null)
+   Use for: specific reasoning, arguments, detailed holdings, evidence, any quote.
+   Optional role_filter: "Ratio Decidendi", "Facts", "Arg · Petitioner", "Arg · Respondent", "Disposition"
+   E.g. "What did the court say about res judicata?", "What was the respondent's argument?"
+
+RETURN EMPTY TOOLS LIST when the question does NOT require looking up the document:
+- Follow-up elaboration on something already said ("explain that further", "give an example")
+- Translation or paraphrase of a previous response ("translate to Hindi", "simplify that")
+- General legal concept questions not tied to this document
+- Conversational: greetings, thanks, clarifications of your own prior reply
+- The conversation history already contains all the information needed
+
+COMBINATION RULES (use the minimum necessary):
+- Pure identity facts → get_metadata only
+- Overview / summary → get_summary only
+- Cited cases / statutes → get_precedents only
+- Specific argument or reasoning → retrieve_paragraphs only
+- Detailed analysis needing both facts and text → get_metadata + retrieve_paragraphs
+- Always include doc_id in every tool's args
+- retrieve_paragraphs at most once
+
+Return ONLY valid JSON (no markdown):
+{{"tools": [{{"tool": "<name>", "args": {{...}}}}]}}
+For no tools needed: {{"tools": []}}
+"""
+
+_PLANNER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", _PLANNER_SYSTEM),
+    MessagesPlaceholder("history"),
+    ("human", "doc_id: {doc_id}\nQuestion: {question}"),
+])
+
+_DIRECT_SYSTEM = (
+    "You are a helpful legal assistant chatting about an Indian Supreme Court judgment.\n"
+    "Use the conversation history to answer naturally and helpfully.\n"
+    "Be concise but warm. If elaborating on a prior answer, build on it directly.\n"
+    "If asked to translate, translate accurately. If asked to simplify, use plain language.\n"
+    "Do not invent legal facts not already established in this conversation."
+)
+
+_DIRECT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", _DIRECT_SYSTEM),
+    MessagesPlaceholder("history"),
+    ("human", "{question}"),
+])
+
+_ANSWER_SYSTEM = (
+    "You are a knowledgeable legal assistant discussing an Indian Supreme Court judgment.\n"
+    "Ground your answer in the retrieved excerpts below and the conversation history.\n"
+    "When quoting or closely paraphrasing a paragraph, cite it as [Para N]. "
+    "Not every sentence needs a citation — cite where it adds clarity.\n\n"
+    "FORMAT — keep it natural:\n"
+    "* Short factual question: answer in 1-2 direct sentences.\n"
+    "* Explanatory question: clear prose, cite key passages.\n"
+    "* Complex legal analysis: IRAC with **bold** labels only when the question genuinely calls for it.\n\n"
+    "Never fabricate para numbers, party names, dates, or outcomes not found in the excerpts.\n"
+    "If the excerpts don't cover something, say so briefly.\n\n"
+    "RETRIEVED EXCERPTS:\n{context}"
+)
+
+_ANSWER_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", _ANSWER_SYSTEM),
+    MessagesPlaceholder("history"),
+    ("human", "{question}"),
+])
+
+
+async def _plan_tool_calls(
+    question: str,
+    doc_id: str | None,
+    hist_messages: list | None = None,
+    request_id: str = "",
+) -> list[dict]:
+    """One LLM call: decide which tools to call for this question."""
+    loop = asyncio.get_running_loop()
+    chain = _PLANNER_PROMPT | get_chunk_llm() | StrOutputParser() | _STRIP_THINK | _STRIP_FENCES
+    try:
+        raw = await loop.run_in_executor(
+            None,
+            chain.invoke,
+            {"doc_id": doc_id or "", "question": question, "history": hist_messages or []},
+        )
+        data = json.loads(raw)
+        return data.get("tools", [])
+    except Exception as exc:
+        log.warning("[%s] _plan_tool_calls failed: %s", request_id, exc)
+        return [{"tool": "retrieve_paragraphs", "args": {"doc_id": doc_id, "query": question, "k": 6}}]
+
+
+def _build_context(tool_results: list[dict]) -> str:
+    """Assemble the context string from tool results for the answer prompt."""
+    context_parts = []
+    for item in tool_results:
+        tool = item["tool"]
+        result = item["result"]
+        if tool == "retrieve_paragraphs" and isinstance(result, list):
+            for r in result:
+                irac = f"[{r.get('irac_slot', '')}] " if r.get("irac_slot") else ""
+                context_parts.append(f"[Para {r['para_no']}] {irac}{r['body']}")
+        elif isinstance(result, dict):
+            context_parts.append(f"[{tool.upper()}]\n{json.dumps(result, indent=2)[:1000]}")
+        elif isinstance(result, list):
+            context_parts.append(f"[{tool.upper()}]\n{json.dumps(result, indent=2)[:1000]}")
+    return "\n\n".join(context_parts) if context_parts else "No relevant excerpts found."
+
+
+async def _generate_answer(
+    question: str,
+    tool_results: list[dict],
+    hist_messages: list,
+    request_id: str = "",
+) -> str:
+    """Non-streaming answer generation (kept for compatibility/fallback use)."""
+    loop = asyncio.get_running_loop()
+    if not tool_results:
+        chain = _DIRECT_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
+        try:
+            return await loop.run_in_executor(
+                None, chain.invoke,
+                {"history": hist_messages, "question": question},
+            )
+        except Exception as exc:
+            log.warning("[%s] _generate_answer (direct) failed: %s", request_id, exc)
+            return "I'm not sure — could you rephrase that?"
+
+    context = _build_context(tool_results)
+    chain = _ANSWER_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
+    try:
+        return await loop.run_in_executor(
+            None, chain.invoke,
+            {"context": context, "history": hist_messages, "question": question},
+        )
+    except Exception as exc:
+        log.warning("[%s] _generate_answer failed: %s", request_id, exc)
+        return "Unable to generate an answer from the available excerpts."
+
+
 async def stream_chat(
     question: str, chunks: list, history: list[dict], doc_id: str | None = None
 ):
-    yield f"data: {json.dumps({'token': '', 'status': 'retrieving', 'done': False})}\n\n"
-
     loop = asyncio.get_running_loop()
-    embedder = OllamaEmbeddings(model=_RAG_EMBED_MODEL)
-
-    # ── STEP A: metadata short-circuit ────────────────────────────────────────
-    if (
-        doc_id
-        and re.search(
-            r"\b(who|judge|court|date|citation|parties|reportable|outcome|decided)\b",
-            question,
-            re.IGNORECASE,
-        )
-        and not re.search(
-            r"\b(ratio|argued|section|article|issue|fact)\b",
-            question,
-            re.IGNORECASE,
-        )
-        and doc_id in _doc_store
-    ):
-        meta = _doc_store[doc_id].get("metadata", {})
-        yield f"data: {json.dumps({'token': json.dumps(meta), 'done': True, 'sources': ['metadata']})}\n\n"
-        return
-
-    # ── STEP B: summary short-circuit ─────────────────────────────────────────
-    if re.search(
-        r"\b(summar|overview|what is this case|explain this|what happened|what was decided)\b",
-        question,
-        re.IGNORECASE,
-    ):
-        summary = _doc_store.get(doc_id, {}).get("summary", "") if doc_id else ""
-        if summary:
-            yield f"data: {json.dumps({'token': summary, 'done': True, 'sources': ['summary']})}\n\n"
-            return
+    request_id = uuid.uuid4().hex[:12]
+    yield f"data: {json.dumps({'token': '', 'status': 'thinking', 'request_id': request_id, 'done': False})}\n\n"
 
     # ── Index setup ────────────────────────────────────────────────────────────
     _transient_bundle: list = [None]
 
     if doc_id:
         if doc_id not in _embed_events:
-            evt = asyncio.Event()
+            evt: asyncio.Event = asyncio.Event()
             _embed_events[doc_id] = evt
 
             async def _build_and_signal() -> None:
                 try:
                     bundle = await loop.run_in_executor(None, _build_index, chunks)
-                    _embedding_cache[doc_id] = bundle
+                    with _store_lock:
+                        _embedding_cache[doc_id] = bundle
                 except Exception as _exc:
-                    logging.warning("Index build failed for %s: %s", doc_id, _exc)
+                    log.warning("[%s] Index build failed for %s: %s", request_id, doc_id, _exc)
                 finally:
                     evt.set()
 
@@ -1518,232 +2239,175 @@ async def stream_chat(
     else:
         evt = asyncio.Event()
 
-        async def _build_and_signal() -> None:
+        async def _build_and_signal_transient() -> None:
             try:
-                _transient_bundle[0] = await loop.run_in_executor(
-                    None, _build_index, chunks
-                )
+                _transient_bundle[0] = await loop.run_in_executor(None, _build_index, chunks)
             except Exception as _exc:
-                logging.warning("Index build failed (no doc_id): %s", _exc)
+                log.warning("[%s] Index build failed (no doc_id): %s", request_id, _exc)
             finally:
                 evt.set()
 
-        asyncio.create_task(_build_and_signal())
+        asyncio.create_task(_build_and_signal_transient())
 
-    # ── STEP C: parallel router + index-wait + query-embed ────────────────────
-    _route_prompt = (
-        "Output ONLY JSON (no markdown):\n"
-        '{"tools":[...],"hyde":bool,"reject":bool,"complexity":"simple"|"complex"}\n'
-        "tools: metadata=case identity, section=role-based, bm25=exact terms,\n"
-        "  dense=conceptual, summary=overview.\n"
-        "  Always include dense unless tools is [metadata] or [summary] only.\n"
-        "reject=true ONLY if the question has zero connection to legal/judicial matters.\n"
-        "complexity=simple for single-fact lookups; complex for multi-part legal analysis.\n"
-        f"Question: {question}"
+    # ── History window ─────────────────────────────────────────────────────────
+    original_question = question
+    hist_messages = _build_history_window(history, token_budget=2000)
+
+    # ── Phase 1: Tool planning (before query rewrite — decides if retrieval is needed) ──
+    yield f"data: {json.dumps({'token': '', 'status': 'thinking', 'done': False})}\n\n"
+    planned_tools = await _plan_tool_calls(
+        original_question, doc_id, hist_messages=hist_messages, request_id=request_id
     )
 
-    async def _route_async() -> dict:
+    # ── No-tools fast path: direct conversational answer (real streaming) ────────
+    if not planned_tools:
+        chain = _DIRECT_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
+        draft = ""
         try:
-            llm = get_chunk_llm()
-            raw = await loop.run_in_executor(None, llm.invoke, _route_prompt)
-            text = raw.content if hasattr(raw, "content") else str(raw)
-            return json.loads(text)
-        except Exception:
-            return {"tools": ["bm25", "dense"], "hyde": False}
-
-    try:
-        route_result, _, q_vec_raw = await asyncio.gather(
-            _route_async(),
-            asyncio.wait_for(evt.wait(), timeout=60),
-            loop.run_in_executor(None, embedder.embed_query, question[:1800]),
-        )
-    except asyncio.TimeoutError:
-        yield f"data: {json.dumps({'token': '[Index build timed out]', 'done': True, 'sources': []})}\n\n"
-        return
-    except Exception as exc:
-        yield f"data: {json.dumps({'token': f'[Retrieval error: {exc}]', 'done': True, 'sources': []})}\n\n"
+            async for token in chain.astream({"history": hist_messages, "question": original_question}):
+                if token:
+                    draft += token
+                    yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
+        except Exception as exc:
+            log.warning("[%s] direct stream failed: %s", request_id, exc)
+            if not draft:
+                draft = "I'm not sure — could you rephrase that?"
+                yield f"data: {json.dumps({'token': draft, 'done': False})}\n\n"
+        yield f"data: {json.dumps({'token': '', 'done': True, 'sources': []})}\n\n"
+        yield f"data: {json.dumps({'citation_check': {'verified': [], 'hallucinated': []}, 'done': True})}\n\n"
+        yield f"data: {json.dumps({'critic': {'passed': True, 'score': 1.0, 'hallucinated_cites': []}, 'done': True})}\n\n"
+        yield f"data: {json.dumps({'tools_used': [], 'done': True})}\n\n"
         return
 
+    # ── Phase 0: Query rewriting (only when retrieval is needed) ──────────────
+    yield f"data: {json.dumps({'token': '', 'status': 'rewriting query', 'done': False})}\n\n"
+    expanded_queries = await _rewrite_query(original_question)
+    primary_query = expanded_queries[0]
+
+    # ── Phase 2: Execute tools (parallel) ─────────────────────────────────────
+    yield f"data: {json.dumps({'token': '', 'status': 'retrieving', 'done': False})}\n\n"
+
+    needs_retrieve = any(tc.get("tool") == "retrieve_paragraphs" for tc in planned_tools)
+    if needs_retrieve:
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            log.warning("[%s] Index build timed out", request_id)
+            yield f"data: {json.dumps({'token': '[Index build timed out]', 'done': True, 'sources': []})}\n\n"
+            return
     index_bundle = _embedding_cache.get(doc_id) if doc_id else _transient_bundle[0]
-    if index_bundle is None:
-        yield f"data: {json.dumps({'token': '[Index unavailable]', 'done': True, 'sources': []})}\n\n"
-        return
 
-    if route_result.get("reject", False):
-        yield (
-            f"data: {json.dumps({'token': 'This question does not appear to relate to the loaded judgment. Please ask something about the case, its parties, legal issues, or the court’s reasoning.', 'done': True, 'sources': []})}\n\n"
-        )
-        return
+    # If eager embed failed silently, rebuild the index inline before retrieval
+    if needs_retrieve and index_bundle is None and chunks:
+        log.warning("[%s] Index bundle missing for %s — rebuilding inline", request_id, doc_id or "transient")
+        yield f"data: {json.dumps({'token': '', 'status': 'building index', 'done': False})}\n\n"
+        try:
+            index_bundle = await asyncio.wait_for(
+                loop.run_in_executor(None, _build_index, chunks),
+                timeout=120,
+            )
+            if doc_id and index_bundle is not None:
+                with _store_lock:
+                    _embedding_cache[doc_id] = index_bundle
+            elif index_bundle is not None:
+                _transient_bundle[0] = index_bundle
+        except asyncio.TimeoutError:
+            log.warning("[%s] Inline index rebuild timed out", request_id)
+        except Exception as _exc:
+            log.warning("[%s] Inline index rebuild failed: %s", request_id, _exc)
 
-    tools = route_result.get("tools", ["bm25", "dense"])
-    hyde = route_result.get("hyde", False)
-
-    # ── STEP D: concurrent retrieval ──────────────────────────────────────────
-    retrieval_coros: list = []
-
-    if "dense" in tools:
-
-        async def _dense_retrieve() -> list:
-            q_vec = np.array([q_vec_raw], dtype=np.float32)
-            q_vec = np.nan_to_num(q_vec, nan=0.0, posinf=0.0, neginf=0.0)
-            if np.linalg.norm(q_vec) == 0.0:
-                q_vec[0] = 1.0 / np.sqrt(q_vec.shape[1])
-            faiss.normalize_L2(q_vec)
-            search_vec = q_vec
-            if hyde:
-                hyde_prompt = (
-                    "Write a one-paragraph Indian Supreme Court judgment "
-                    f"excerpt answering: {question}"
-                )
-                try:
-                    hyde_raw = await loop.run_in_executor(
-                        None, embedder.embed_query, hyde_prompt[:1800]
-                    )
-                    h_vec = np.array([hyde_raw], dtype=np.float32)
-                    h_vec = np.nan_to_num(h_vec, nan=0.0, posinf=0.0, neginf=0.0)
-                    if np.linalg.norm(h_vec) > 0.0:
-                        faiss.normalize_L2(h_vec)
-                        search_vec = (q_vec + h_vec) / 2.0
-                        faiss.normalize_L2(search_vec)
-                except Exception:
-                    pass
-            fi = index_bundle.faiss_index
-            pk = index_bundle.para_keys
-            _, idxs = fi.search(search_vec, min(20, len(pk)))
-            bm = {c["para_no"]: c["body"] for c in chunks}
-            return [
-                {
-                    "para_no": pk[i],
-                    "body": bm[pk[i]],
-                    "score": 1.0 - rank * 0.05,
-                    "source": "dense",
-                }
-                for rank, i in enumerate(idxs[0])
-                if i >= 0 and pk[i] in bm
-            ]
-
-        retrieval_coros.append(_dense_retrieve())
-
-    if "bm25" in tools:
-        retrieval_coros.append(
-            loop.run_in_executor(None, _bm25_retrieve, question, chunks, index_bundle)
-        )
-
-    if "section" in tools:
-        retrieval_coros.append(
-            loop.run_in_executor(None, _section_retrieve, question, chunks)
-        )
-
-    raw_results = (
-        await asyncio.gather(*retrieval_coros, return_exceptions=True)
-        if retrieval_coros
-        else []
-    )
-    lists = [r for r in raw_results if isinstance(r, list)]
-
-    # ── STEP E: fuse + expand + rerank ────────────────────────────────────────
-    fused = _rrf_fuse(lists)
-
-    para_map = {c["para_no"]: c for c in chunks}
-    present = {item["para_no"] for item in fused}
-    expansions: list = []
-    for item in fused[:20]:
-        c = para_map.get(item["para_no"], {})
-        for nb_key in ("prev_para_no", "next_para_no"):
-            nb_pn = c.get(nb_key)
-            if nb_pn and nb_pn not in present and nb_pn in para_map:
-                expansions.append(
-                    {
-                        "para_no": nb_pn,
-                        "body": para_map[nb_pn]["body"],
-                        "score": item["score"] * 0.7,
-                        "source": "context_expansion",
-                    }
-                )
-                present.add(nb_pn)
-
-    candidates = fused + expansions
-    try:
-        cross_enc = get_cross_encoder()
-        pairs = [(question, item["body"]) for item in candidates]
-        ce_scores = await loop.run_in_executor(None, cross_enc.predict, pairs)
-        ce_arr = np.array(ce_scores, dtype=np.float32)
-        sigmoid_scores = (1.0 / (1.0 + np.exp(-ce_arr))).tolist()
-        for item, s in zip(candidates, sigmoid_scores):
-            item["score"] = float(s)
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-    except Exception as exc:
-        logging.warning("Rerank failed: %s", exc)
-
-    top5 = candidates[:5]
-
-    # ── STEP F: rolling history (keep 6 verbatim; summarise overflow once) ────
-    _HIST_WINDOW = 6
-    if len(history) > _HIST_WINDOW:
-        older = history[:-_HIST_WINDOW]
-        recent = history[-_HIST_WINDOW:]
-        # Use a cached summary stored in _doc_store so it is computed once per
-        # session, not on every turn.
-        cached_summary = (
-            _doc_store[doc_id].get("_hist_summary", "")
-            if doc_id and doc_id in _doc_store
-            else ""
-        )
-        if not cached_summary:
-            try:
-                summary_prompt = (
-                    "Summarise the following conversation turns in one short paragraph:\n"
-                    + "\n".join(f"{h['role']}: {h['content']}" for h in older)
-                )
-                llm = get_chunk_llm()
-                raw = await loop.run_in_executor(None, llm.invoke, summary_prompt)
-                cached_summary = raw.content if hasattr(raw, "content") else str(raw)
-                if doc_id and doc_id in _doc_store:
-                    _doc_store[doc_id]["_hist_summary"] = cached_summary
-            except Exception:
-                cached_summary = ""
-        if cached_summary:
-            hist_messages = [
-                SystemMessage(content=f"Earlier conversation summary: {cached_summary}")
-            ]
-            hist_messages += _history_to_messages(recent)
+    # Expand retrieve_paragraphs once per rewritten query
+    expanded_tool_calls: list[dict] = []
+    for tc in planned_tools:
+        if tc.get("tool") == "retrieve_paragraphs":
+            for q in expanded_queries:
+                expanded_tool_calls.append({**tc, "args": {**tc.get("args", {}), "query": q}})
         else:
-            hist_messages = _history_to_messages(recent)
-    else:
-        hist_messages = _history_to_messages(history)
+            expanded_tool_calls.append(tc)
 
-    # ── STEP G: stream LLM + citation check ───────────────────────────────────
-    # Build role lookup from original chunks so IRAC slots can be injected
-    _role_map = {c["para_no"]: c.get("role", "") for c in chunks}
-    context_parts = []
-    for item in top5:
-        irac_slot = _ROLE_TO_IRAC.get(_role_map.get(item["para_no"], ""), "")
-        slot_prefix = f"[{irac_slot}] " if irac_slot else ""
-        context_parts.append(f"[Para {item['para_no']}] {slot_prefix}{item['body']}")
-    context = "\n\n".join(context_parts)
-    sources = [f"Para {item['para_no']}" for item in top5]
-    retrieved_ids = {item["para_no"] for item in top5}
-    chain = _get_rag_chain()
+    raw_results = await asyncio.gather(*[
+        _execute_tool(tc, doc_id, chunks, index_bundle, primary_query, request_id=request_id)
+        for tc in expanded_tool_calls
+    ])
 
-    full_response: list = []
-    try:
-        async for tok in chain.astream(
-            {
-                "context": context,
-                "history": hist_messages,
-                "question": question,
+    # Merge results; deduplicate retrieve_paragraphs across expanded queries
+    tool_results: list[dict] = []
+    seen_para_nos: set[str] = set()
+    retrieved_ids: set[str] = set()
+    tools_called: list[dict] = []
+
+    for tc, result in zip(expanded_tool_calls, raw_results):
+        tool_name = tc.get("tool", "")
+        if tool_name == "retrieve_paragraphs" and isinstance(result, list):
+            new_results = [r for r in result if r.get("para_no") not in seen_para_nos]
+            seen_para_nos |= {
+                r["para_no"] for r in result if isinstance(r, dict) and "para_no" in r
             }
-        ):
-            full_response.append(tok)
-            yield f"data: {json.dumps({'token': tok, 'done': False})}\n\n"
-        yield f"data: {json.dumps({'token': '', 'done': True, 'sources': sources})}\n\n"
-        response_text = "".join(full_response)
-        cited_ids = set(re.findall(r"\[Para ([^\]]+)\]", response_text))
-        yield (
-            f"data: {json.dumps({'citation_check': {'verified': list(cited_ids & retrieved_ids), 'hallucinated': list(cited_ids - retrieved_ids)}, 'done': True})}\n\n"
-        )
+            retrieved_ids |= seen_para_nos
+            if new_results:
+                existing = next(
+                    (t for t in tool_results if t["tool"] == "retrieve_paragraphs"), None
+                )
+                if existing:
+                    existing["result"].extend(new_results)
+                else:
+                    tool_results.append({"tool": tool_name, "result": new_results})
+        else:
+            tool_results.append({"tool": tool_name, "result": result})
+
+        tools_called.append({
+            "tool": tool_name,
+            "args": {k: v for k, v in tc.get("args", {}).items() if k != "doc_id"},
+            "result_summary": _summarise_tool_result(tool_name, result),
+        })
+
+    # ── Phase 3: Stream answer in real time ───────────────────────────────────
+    yield f"data: {json.dumps({'token': '', 'status': 'generating', 'done': False})}\n\n"
+    draft = ""
+    try:
+        if not tool_results:
+            chain = _DIRECT_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
+            invoke_input: dict = {"history": hist_messages, "question": original_question}
+        else:
+            context = _build_context(tool_results)
+            chain = _ANSWER_PROMPT | _get_llm(_RAG_LLM_MODEL) | StrOutputParser()
+            invoke_input = {"context": context, "history": hist_messages, "question": original_question}
+        async for token in chain.astream(invoke_input):
+            if token:
+                draft += token
+                yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
     except Exception as exc:
-        yield f"data: {json.dumps({'token': f'[Chat error: {exc}]', 'done': True, 'sources': []})}\n\n"
+        log.warning("[%s] generation stream failed: %s", request_id, exc)
+        if not draft:
+            draft = "Unable to generate an answer from the available excerpts."
+            yield f"data: {json.dumps({'token': draft, 'done': False})}\n\n"
+
+    # ── Citation check (post-stream) ───────────────────────────────────────────
+    cited_ids = set(re.findall(r"\[Para ([^\]]+)\]", draft))
+    hallucinated = list(cited_ids - retrieved_ids)
+
+    # ── Critic (runs silently after answer is streamed) ────────────────────────
+    try:
+        critic = await _run_critic(
+            original_question, draft, retrieved_ids, chunks, doc_id, request_id=request_id
+        )
+    except Exception as _exc:
+        log.warning("[%s] _run_critic failed: %s", request_id, _exc)
+        critic = CriticResult(
+            passed=not hallucinated, score=1.0 if not hallucinated else 0.6,
+            hallucinated_cites=hallucinated, unsupported_claims=[],
+            coverage_gaps=[], feedback="",
+        )
+
+    # ── Final events ───────────────────────────────────────────────────────────
+    sources = [
+        f"Para {p}"
+        for p in sorted(retrieved_ids, key=lambda x: int(x) if x.isdigit() else 0)
+    ]
+    yield f"data: {json.dumps({'token': '', 'done': True, 'sources': sources})}\n\n"
+    yield f"data: {json.dumps({'citation_check': {'verified': list(cited_ids & retrieved_ids), 'hallucinated': hallucinated}, 'done': True})}\n\n"
+    yield f"data: {json.dumps({'critic': {'passed': critic.passed, 'score': critic.score, 'hallucinated_cites': critic.hallucinated_cites}, 'done': True})}\n\n"
+    yield f"data: {json.dumps({'tools_used': tools_called, 'done': True})}\n\n"
 
 
 # ── Request models ─────────────────────────────────────────────────────────────
@@ -1764,11 +2428,16 @@ class ChatRequest(BaseModel):
 
 def _resolve_chunks(doc_id: str | None, chunks: list) -> list:
     if doc_id and doc_id in _doc_store:
+        with _store_lock:
+            if doc_id in _doc_store:
+                _doc_store.move_to_end(doc_id)
         return _doc_store[doc_id]["chunks"]
     return chunks
 
 
 class SimilarResult(BaseModel):
+    case_title: str = ""
+    citation: str = ""
     case_number: str
     case_type: str
     court: str
@@ -1842,16 +2511,17 @@ async def extract_endpoint(file: UploadFile = File(...)):
 
     doc_id = uuid.uuid4().hex
     _evict_if_needed()
-    _doc_store[doc_id] = {
-        "chunks": chunks,
-        "header": header_raw,
-        "footer": footer_raw,
-        "metadata": meta,
-        "metadata_regex": meta_regex,
-        "metadata_llm": meta_llm,
-        "markdown": raw_md,
-        "raw_md_tail": raw_md[-3000:],
-    }
+    with _store_lock:
+        _doc_store[doc_id] = {
+            "chunks": chunks,
+            "header": header_raw,
+            "footer": footer_raw,
+            "metadata": meta,
+            "metadata_regex": meta_regex,
+            "metadata_llm": meta_llm,
+            "markdown": raw_md,
+            "raw_md_tail": raw_md[-3000:],
+        }
 
     def _eager_embed(
         did: str, ch: list, _loop: asyncio.AbstractEventLoop, _evt: asyncio.Event
@@ -1860,16 +2530,45 @@ async def extract_endpoint(file: UploadFile = File(...)):
             _loop.call_soon_threadsafe(_evt.set)
             return
         try:
-            _embedding_cache[did] = _build_index(ch)
+            bundle = _build_index(ch)
+            with _store_lock:
+                _embedding_cache[did] = bundle
         except Exception as exc:
             logging.warning("Eager embed failed for %s: %s", did, exc)
         finally:
             _loop.call_soon_threadsafe(_evt.set)
 
+    def _llm_enrich_background(did: str, text: str) -> None:
+        """Run _llm_extract and store results so agent tools have data immediately."""
+        try:
+            extraction = _llm_extract(text)
+            with _store_lock:
+                if did in _doc_store:
+                    _doc_store[did].update({
+                        "summary":         extraction.summary,
+                        "ratio_decidendi": extraction.ratio_decidendi,
+                        "outcome":         extraction.outcome,
+                        "precedents": [
+                            {"citation": p.citation, "case_title": p.case_title, "role": p.role}
+                            for p in extraction.precedents
+                        ],
+                        "provisions": [
+                            {"text": p.text, "role": p.role}
+                            for p in extraction.provisions
+                        ],
+                        "statutes": extraction.statutes,
+                    })
+        except Exception as exc:
+            logging.warning("_llm_enrich_background failed for %s: %s", did, exc)
+
     _loop = asyncio.get_running_loop()
-    _embed_evt = _embed_events.setdefault(doc_id, asyncio.Event())
+    _embed_evt = asyncio.Event()
+    _embed_events[doc_id] = _embed_evt
     threading.Thread(
         target=_eager_embed, args=(doc_id, chunks, _loop, _embed_evt), daemon=True
+    ).start()
+    threading.Thread(
+        target=_llm_enrich_background, args=(doc_id, raw_md[:15_000]), daemon=True
     ).start()
 
     return {
@@ -1940,7 +2639,7 @@ async def similar_endpoint(
 
     # 2+3 — LLM extraction and NER run concurrently (independent inputs, both thread-pool-bound)
     extraction, spans = await asyncio.gather(
-        loop.run_in_executor(None, _llm_extract, raw_text),
+        loop.run_in_executor(None, _llm_extract_query, raw_text),
         loop.run_in_executor(None, _extract_legal_spans, raw_text),
     )
     canon = canonicalize_spans(spans)
@@ -2038,7 +2737,7 @@ async def similar_endpoint(
                 {"text": p.text, "role": p.role} for p in extraction.provisions
             ],
             query_precedents=[
-                {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+                {"citation": p.citation, "case_title": p.case_title, "role": p.role}
                 for p in extraction.precedents
             ],
             query_statutes=extraction.statutes,
@@ -2053,7 +2752,7 @@ async def similar_endpoint(
                 {"text": p.text, "role": p.role} for p in extraction.provisions
             ],
             query_precedents=[
-                {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+                {"citation": p.citation, "case_title": p.case_title, "role": p.role}
                 for p in extraction.precedents
             ],
             query_statutes=extraction.statutes,
@@ -2120,6 +2819,8 @@ async def similar_endpoint(
 
         results.append(
             SimilarResult(
+                case_title=p.get("case_title", ""),
+                citation=p.get("citation", ""),
                 case_number=p.get("case_number", ""),
                 case_type=p.get("case_type", ""),
                 court=p.get("court", ""),
@@ -2157,7 +2858,7 @@ async def similar_endpoint(
             {"text": p.text, "role": p.role} for p in extraction.provisions
         ],
         query_precedents=[
-            {"citation": p.citation, "short_name": p.short_name, "role": p.role}
+            {"citation": p.citation, "case_title": p.case_title, "role": p.role}
             for p in extraction.precedents
         ],
         query_statutes=extraction.statutes,

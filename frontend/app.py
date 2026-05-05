@@ -303,6 +303,29 @@ def show_pdf(pdf_bytes: bytes) -> None:
     )
 
 
+def _render_assistant_msg(msg: dict) -> None:
+    st.markdown(msg["content"])
+    tools = msg.get("tools_used") or []
+    if tools:
+        with st.expander(f"Tools used ({len(tools)})", expanded=False):
+            for t in tools:
+                summary = t.get("result_summary", "")
+                args = {k: v for k, v in (t.get("args") or {}).items()}
+                arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) if args else ""
+                label = f"**{t['tool']}**"
+                if arg_str:
+                    label += f"({arg_str})"
+                if summary:
+                    label += f" — {summary}"
+                st.caption(label)
+    critic = msg.get("critic")
+    if critic and not critic.get("passed", True):
+        st.caption(
+            f"Critic score {critic.get('score', 0):.2f} · "
+            + (f"gaps: {', '.join(critic['coverage_gaps'])}" if critic.get("coverage_gaps") else "")
+        )
+
+
 def inject_chat_fab() -> None:
     doc_id = st.session_state.get("doc_id", "") or ""
 
@@ -319,19 +342,26 @@ def inject_chat_fab() -> None:
                 if msg["role"] == "user":
                     st.chat_message("user").write(msg["content"])
                 else:
-                    st.chat_message("assistant").markdown(msg["content"])
+                    with st.chat_message("assistant"):
+                        _render_assistant_msg(msg)
 
         question = st.chat_input("Ask about this judgment…", key="chat_input_fab")
         if question and doc_id:
             st.session_state.setdefault("chat_history", []).append(
                 {"role": "user", "content": question}
             )
-            sources = []
+            sources: list = []
+            tools_used: list = []
+            critic_result: dict = {}
             streamed = ""
+
             with chat_container:
                 st.chat_message("user").write(question)
                 with st.chat_message("assistant"):
+                    status_placeholder = st.empty()
                     response_placeholder = st.empty()
+                    tools_placeholder = st.empty()
+                    status_placeholder.caption("Thinking…")
                     try:
                         with httpx.stream(
                             "POST",
@@ -345,15 +375,58 @@ def inject_chat_fab() -> None:
                             timeout=300,
                         ) as r:
                             for line in r.iter_lines():
-                                if line.startswith("data: "):
-                                    data = _json.loads(line[6:])
-                                    if not data.get("done"):
-                                        streamed += data.get("token", "")
+                                if not line.startswith("data: "):
+                                    continue
+                                data = _json.loads(line[6:])
+                                # tools_used footer event
+                                if "tools_used" in data:
+                                    tools_used = data["tools_used"]
+                                    if tools_used:
+                                        tools_placeholder.caption(
+                                            f"Used {len(tools_used)} tool(s): "
+                                            + ", ".join(t["tool"] for t in tools_used)
+                                        )
+                                # critic event
+                                elif "critic" in data:
+                                    critic_result = data["critic"]
+                                # sources event
+                                elif "sources" in data:
+                                    sources = data["sources"]
+                                # status / heartbeat event (no token)
+                                elif not data.get("done") and not data.get("token"):
+                                    status_text = data.get("status", "thinking")
+                                    status_placeholder.caption(f"{status_text.capitalize()}…")
+                                # token event
+                                elif not data.get("done"):
+                                    token = data.get("token", "")
+                                    if token:
+                                        status_placeholder.empty()
+                                        streamed += token
                                         response_placeholder.markdown(streamed + "▌")
-                                    elif "sources" in data:
-                                        sources = data["sources"]
+
                         response_placeholder.markdown(streamed)
+                        tools_placeholder.empty()
+                        # render tools expander inline after answer
+                        if tools_used:
+                            with st.expander(f"Tools used ({len(tools_used)})", expanded=False):
+                                for t in tools_used:
+                                    summary = t.get("result_summary", "")
+                                    args = {k: v for k, v in (t.get("args") or {}).items()}
+                                    arg_str = ", ".join(f"{k}={v!r}" for k, v in args.items()) if args else ""
+                                    label = f"**{t['tool']}**"
+                                    if arg_str:
+                                        label += f"({arg_str})"
+                                    if summary:
+                                        label += f" — {summary}"
+                                    st.caption(label)
+                        if critic_result and not critic_result.get("passed", True):
+                            gaps = critic_result.get("coverage_gaps") or []
+                            st.caption(
+                                f"Critic score {critic_result.get('score', 0):.2f}"
+                                + (f" · gaps: {', '.join(gaps)}" if gaps else "")
+                            )
                     except httpx.ConnectError:
+                        status_placeholder.empty()
                         streamed = f"[Cannot reach backend at {BACKEND_URL}]"
                         response_placeholder.markdown(streamed)
 
@@ -361,9 +434,12 @@ def inject_chat_fab() -> None:
             if sources:
                 full_answer += "\n\n**Sources:** " + ", ".join(sources)
 
-            st.session_state["chat_history"].append(
-                {"role": "assistant", "content": full_answer}
-            )
+            st.session_state["chat_history"].append({
+                "role": "assistant",
+                "content": full_answer,
+                "tools_used": tools_used,
+                "critic": critic_result,
+            })
             st.rerun()
 
         if st.session_state.get("chat_history"):
@@ -1038,7 +1114,7 @@ with tab_similar:
             if _qex.get("precedents"):
                 st.markdown("**Precedents**")
                 st.dataframe(
-                    [{"Citation": p["citation"], "Short Name": p["short_name"], "Role": p["role"]} for p in _qex["precedents"]],
+                    [{"Citation": p["citation"], "Case Title": p["case_title"], "Role": p["role"]} for p in _qex["precedents"]],
                     use_container_width=True, hide_index=True,
                 )
             if _qex.get("provisions"):

@@ -37,6 +37,10 @@ from backend.main import (
     Extraction,
     _extract_legal_spans,
     parse_metadata,
+    extract_markdown,
+    split_paragraphs,
+    parse_metadata_llm,
+    _merge_metadata,
 )
 from backend.legal_normalizer import canonicalize_entity
 
@@ -52,7 +56,7 @@ _EMBED_DIM      = 1024
 # NOTE: ensure this model is pulled in Ollama: `ollama pull bge-m3`
 _EMBED_MODEL    = os.getenv("EMBED_MODEL", "bge-m3")
 # NOTE: ensure this model is pulled in Ollama, e.g. `ollama pull llama3.3:70b`
-_LLM_MODEL      = os.getenv("LLM_MODEL", "llama3.1:8b")
+_LLM_MODEL      = os.getenv("LLM_MODEL", "deepseek-v3.1:671b-cloud")
 _BATCH_SIZE     = 32
 # Cloud URL can be overridden via QDRANT_URL env var
 _CLOUD_URL      = os.getenv("QDRANT_URL", "https://2299273f-afca-4fbe-a283-8d8e34a4aa20.us-east4-0.gcp.cloud.qdrant.io:6333")
@@ -60,41 +64,100 @@ _UPSERT_RETRIES = 3
 # Maximum characters sent to the LLM (guards against context-window overflow)
 _MAX_LLM_CHARS  = 15_000
 
-# Standalone extraction prompt — does NOT import SYSTEM_PROMPT from main.py.
-# Uses with_structured_output(Extraction) so no manual JSON parsing is needed.
 _EXTRACTION_SYSTEM = (
-    "You are a senior Indian legal analyst. Extract structured information from the court "
-    "judgment text and respond with ONLY valid JSON — no markdown fences, no explanation.\n\n"
-    "Required JSON schema:\n"
+    "You are extracting structured metadata from Indian legal judgments.\n\n"
+    "Focus on HIGH-QUALITY LEGAL SUMMARIZATION and CLEAN NORMALIZATION.\n"
+    "Do NOT over-structure the output. Keep the schema lightweight and retrieval-friendly.\n\n"
+    "Return ONLY valid JSON — no markdown fences, no explanation:\n\n"
     "{\n"
-    '  "summary": "<3-5 sentences: parties, core legal dispute, procedural history, decision>",\n'
-    '  "ratio_decidendi": ["<legal principle with precedential weight>", "..."],\n'
-    '  "outcome": "<one of: allowed | dismissed | remanded | affirmed | partly allowed | quashed | set aside | unknown>",\n'
+    '  "case_title": "<Petitioner v. Respondent — normalize Vs./vs/versus to v.>",\n'
+    '  "citation": "<e.g. 2024 INSC 123 — full neutral citation if present, else empty>",\n'
+    '  "court": "<full court name>",\n'
+    '  "year": <4-digit integer year of decision>,\n'
+    '  "summary": "<120-300 word legally dense headnote: core legal issue, procedural posture, '
+    'dispute context, key legal principles, precedent relied upon, final holding>",\n'
+    '  "ratio_decidendi": ["<concise doctrinal principle actually applied>", "..."],\n'
+    '  "outcome": "<one of: allowed | dismissed | partly_allowed | remanded | affirmed | '
+    'quashed | set aside | disposed | unknown>",\n'
     '  "provisions": [\n'
     '    {"text": "<Section 302 IPC>", "role": "<decisive|supporting|background|distinguished>"}\n'
     '  ],\n'
     '  "precedents": [\n'
-    '    {"citation": "<full citation>", "short_name": "<Party v Party>",\n'
+    '    {"case_title": "<Party v. Party>", "citation": "<full reporter citation>",\n'
     '     "role": "<relied_upon|followed|distinguished|overruled|merely_cited>"}\n'
-    '  ],\n'
-    '  "statutes": ["<Indian Penal Code, 1860>", "..."]\n'
+    '  ]\n'
     "}\n\n"
-    "ratio_decidendi: 2-6 principles, each a complete sentence citing specific sections/articles.\n"
-    "provisions: every section/article/rule applied or discussed.\n"
-    "precedents: every case citation; citation must be the full reporter string.\n"
-    "statutes: every Act or Code mentioned by name."
+    "INSTRUCTIONS:\n"
+    "case_title: Extract proper case title. Normalize Vs./vs/versus to v. "
+    "Remove trailing footnote numbers and OCR junk. "
+    'Example: "National Insurance Company Limited Vs. Boghara Polyfab Private Limited1" '
+    '→ "National Insurance Co. Ltd. v. Boghara Polyfab Pvt. Ltd."\n'
+    "summary: 120-300 words. Include core legal issue, procedural posture, dispute context, "
+    "important legal principles, key precedent relied upon, and final holding. "
+    "Resemble a professional legal headnote. Avoid generic or shallow summaries.\n"
+    "ratio_decidendi: 2-6 concise doctrinal principles actually applied. Do not repeat the summary.\n"
+    "provisions: every section/article/rule applied or discussed. "
+    "ONE provision per list item — never group multiple sections into one string "
+    "(wrong: 'Sections 302 and 201 IPC'; right: two separate items). "
+    "Always include the Act name with each section.\n"
+    "precedents: every case citation. Merge case_title and citation into one object. "
+    "citation must be the full reporter string. Normalize case_title: remove footnote markers, "
+    "trailing digits, OCR artifacts. Preserve Ltd., Pvt., Co.\n"
+    "outcome: use underscore form for multi-word values (partly_allowed, set_aside)."
 )
 
 
 _VALID_OUTCOMES = frozenset({
     "allowed", "dismissed", "remanded", "affirmed",
-    "partly allowed", "quashed", "set aside", "unknown",
+    "partly allowed", "quashed", "set aside", "disposed", "unknown",
 })
 
 
 def _ws(s: str) -> str:
     """Collapse all whitespace (including PDF-embedded newlines) to single spaces."""
     return re.sub(r'\s+', ' ', s).strip()
+
+
+_FOOTNOTE_TRAIL_RE = re.compile(r'\s*\d{1,3}\s*$')
+_YEAR_FOOTNOTE_RE  = re.compile(r'(\b\d{4})\d{1,4}\b')
+
+def _strip_footnote(s: str) -> str:
+    """Remove trailing footnote digit(s) from case titles: 'Party v. Party1' → 'Party v. Party'."""
+    return _FOOTNOTE_TRAIL_RE.sub('', s).strip()
+
+
+def _clean_statute(s: str) -> str:
+    """Fix OCR year+footnote artifacts: 'CrPC, 197310' → 'CrPC, 1973'."""
+    return _YEAR_FOOTNOTE_RE.sub(r'\1', s).strip()
+
+
+# Regex supplement for statutes spaCy's NER misses (domain-specific Acts/Codes).
+# Requires a year (,YYYY) to avoid false positives from procedural phrases like
+# "set aside the Order" or "reliance on Act". "Order"/"Ordinance" excluded —
+# too common in CPC procedural references (Order XXXVIII Rule 5 etc.).
+_STATUTE_RE = re.compile(
+    r'\b([A-Z][A-Za-z ]{3,60}'
+    r'(?:Act|Code|Rules|Regulations)'
+    r'\s*,\s*\d{4})\b'
+)
+_STATUTE_AND_RE = re.compile(r'\band\b', re.IGNORECASE)
+_STATUTE_MIN_LEN = 10
+
+
+def _extract_statutes_regex(text: str) -> list[tuple[str, str]]:
+    """Regex fallback: extract 'X Act/Code, YYYY' patterns spaCy may miss."""
+    seen: set[str] = set()
+    spans: list[tuple[str, str]] = []
+    for m in _STATUTE_RE.finditer(text):
+        raw = _ws(m.group(0))
+        # "Act and X Rules, YYYY" — conjunction signals a fragment, not a statute name
+        if _STATUTE_AND_RE.search(raw):
+            continue
+        raw = _clean_statute(raw)
+        if len(raw) >= _STATUTE_MIN_LEN and raw not in seen:
+            seen.add(raw)
+            spans.append((raw, "STATUTE"))
+    return spans
 
 
 def _normalize_outcome(raw: str) -> str:
@@ -109,9 +172,15 @@ def _normalize_outcome(raw: str) -> str:
     return "unknown"
 
 
-def _parse_ingest_response(raw: str) -> Extraction:
-    """Parse LLM JSON response into Extraction. No import of _parse_extraction from main."""
+def _parse_ingest_response(raw: str) -> tuple[Extraction, dict]:
+    """Parse LLM JSON into (Extraction, extras).
+
+    extras carries top-level fields the new schema adds (case_title, citation,
+    court, year) without requiring changes to the shared Extraction model in main.py.
+    statutes are intentionally omitted — spaCy NER fills them via _merge_entities.
+    """
     clean = re.sub(r'^```[a-z]*\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    _empty_extras: dict = {"case_title": "", "citation": "", "court": "", "year": 0}
     try:
         data = json.loads(clean)
         provisions = []
@@ -130,17 +199,29 @@ def _parse_ingest_response(raw: str) -> Extraction:
                 if citation:
                     precedents.append(CasedPrecedent(
                         citation=citation,
-                        short_name=_ws(str(p.get("short_name", citation))),
+                        case_title=_strip_footnote(_ws(str(p.get("case_title", citation)))),
                         role=_ws(str(p.get("role", "merely_cited"))),
                     ))
-        return Extraction(
+        year_raw = data.get("year", 0)
+        try:
+            year_int = int(str(year_raw)) if year_raw else 0
+        except (ValueError, TypeError):
+            year_int = 0
+        extras = {
+            "case_title": _strip_footnote(_ws(str(data.get("case_title", "")))),
+            "citation":   _ws(str(data.get("citation", ""))),
+            "court":      _ws(str(data.get("court", ""))),
+            "year":       year_int,
+        }
+        extraction = Extraction(
             summary=_ws(str(data.get("summary", ""))),
             ratio_decidendi=[_ws(str(r)) for r in data.get("ratio_decidendi", []) if str(r).strip()],
             outcome=_normalize_outcome(str(data.get("outcome", "unknown"))),
             provisions=provisions,
             precedents=precedents,
-            statutes=[_ws(str(s)) for s in data.get("statutes", []) if str(s).strip()],
+            statutes=[],  # spaCy fills statutes via _merge_entities
         )
+        return extraction, extras
     except Exception as exc:
         log.warning("LLM JSON parse failed (response len=%d): %s — using regex fallback", len(raw), exc)
         m_s = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
@@ -149,7 +230,7 @@ def _parse_ingest_response(raw: str) -> Extraction:
             summary=_ws(m_s.group(1)) if m_s else "",
             ratio_decidendi=[],
             outcome=_normalize_outcome(m_o.group(1)) if m_o else "unknown",
-        )
+        ), _empty_extras
 
 
 # ── Collection + index setup ──────────────────────────────────────────────────
@@ -256,13 +337,7 @@ def _merge_entities(
             prov[c] = text
             prov_roles[text] = p.role
 
-    for s in extraction.statutes:
-        s = _ws(s)
-        if not s:
-            continue
-        c = canonicalize_entity(s, "STATUTE")
-        if c not in stat:
-            stat[c] = s
+    # statutes intentionally omitted here — spaCy NER fills the stat dict below.
 
     for p in extraction.precedents:
         citation = _ws(p.citation)
@@ -280,30 +355,49 @@ def _merge_entities(
         if not raw:
             continue
         if label == "PROVISION":
+            # Skip compound multi-section spans — "Sections 302 and 201 IPC" or
+            # "Sections 395, 363, 365" canonicalize to useless slugs that never
+            # match individual act-qualified canons during Jaccard scoring.
+            if re.match(r'^sections?\s+\d', raw, re.I) and re.search(r'[,&]|\band\b', raw, re.I):
+                continue
             c = canonicalize_entity(raw, "PROVISION")
             if c not in prov:
                 prov[c] = raw
                 prov_roles[raw] = "background"
         elif label == "STATUTE":
+            raw = _clean_statute(raw)
             c = canonicalize_entity(raw, "STATUTE")
             if c not in stat:
                 stat[c] = raw
         elif label == "PRECEDENT":
+            raw = _strip_footnote(raw)
             c = canonicalize_entity(raw, "PRECEDENT")
             if c not in prec:
                 prec[c] = raw
                 prec_roles[raw] = "merely_cited"
 
     # Remove bare provision slugs subsumed by an act-qualified canonical.
-    # e.g. "_401" (from bare "Section 401") is redundant when "crpc_401" already exists.
-    qualified = {c for c in prov if not c.startswith("_")}
+    # Handles two bare-canon forms produced by _canon_provision when the Act is missing:
+    #   "_401"       (very short bare slug)
+    #   "section_27" (slugified "Section 27" with no Act)
+    # Both are redundant when "crpc_401" / "ea_27" already exists.
+    _BARE_PROV_RE = re.compile(r'^(?:sections?|articles?|rules?)_(.+)$')
+    qualified = {
+        c for c in prov
+        if not c.startswith("_") and not _BARE_PROV_RE.match(c)
+    }
     for c in list(prov):
+        suffix = None
         if c.startswith("_"):
-            num = c.lstrip("_")
-            if any(q.endswith(f"_{num}") for q in qualified):
-                raw_text = prov[c]
-                prov_roles.pop(raw_text, None)
-                del prov[c]
+            suffix = c.lstrip("_")
+        else:
+            m = _BARE_PROV_RE.match(c)
+            if m:
+                suffix = m.group(1)
+        if suffix and any(q.endswith(f"_{suffix}") for q in qualified):
+            raw_text = prov[c]
+            prov_roles.pop(raw_text, None)
+            del prov[c]
 
     canon_dict: dict[str, list[str]] = {
         "provisions_raw":   list(prov.values()),
@@ -363,11 +457,41 @@ def _process_pdf_sync(
         SystemMessage(content=_EXTRACTION_SYSTEM),
         HumanMessage(content=f"Judgment text:\n\n{truncated}"),
     ])
-    extraction: Extraction = _parse_ingest_response(resp.content)
+    extraction, llm_extras = _parse_ingest_response(resp.content)
 
-    spacy_spans = _extract_legal_spans(truncated)
-    canon, prov_roles, prec_roles = _merge_entities(extraction, spacy_spans)
-    meta = parse_metadata(truncated)
+    spacy_spans  = _extract_legal_spans(truncated)
+    regex_spans  = _extract_statutes_regex(truncated)
+    # Combine: spaCy primary, regex fills statute gaps (dedup happens inside _merge_entities)
+    all_spans    = spacy_spans + regex_spans
+    canon, prov_roles, prec_roles = _merge_entities(extraction, all_spans)
+
+    # ── Metadata: markdown → header slice → regex + LLM → merge ──────────────
+    # parse_metadata's Priority-1 party-name patterns use markdown bold markers
+    # (**Name**) that fitz plain-text never produces. Using extract_markdown +
+    # split_paragraphs gives the same header_raw that /extract uses, so the
+    # regex and LLM metadata pipelines match exactly.
+    pdf_bytes  = pdf_path.read_bytes()
+    raw_md     = extract_markdown(pdf_bytes)
+    header_raw, _, _ = split_paragraphs(raw_md)
+    meta_regex = parse_metadata(header_raw)
+    meta_llm   = parse_metadata_llm(header_raw)
+    meta       = _merge_metadata(meta_llm, meta_regex)
+
+    # LLM extraction is fallback for metadata fields parse_metadata may miss.
+    court = meta.get("court", "") or llm_extras.get("court", "")
+
+    year_raw = meta.get("case_year", "") or ""
+    try:
+        m = re.search(r'\d{4}', str(year_raw))
+        year = int(m.group(0)) if m else (llm_extras.get("year") or 0)
+    except Exception:
+        year = llm_extras.get("year") or 0
+
+    # case_title: LLM extraction primary (cleaned, normalized by the prompt).
+    # citation: header metadata primary (more reliable for neutral citations),
+    #           LLM extraction as fallback.
+    case_title = llm_extras.get("case_title", "")
+    citation   = meta.get("citation", "") or llm_extras.get("citation", "")
 
     ratio_text  = " ".join(extraction.ratio_decidendi) or extraction.summary
     master_text = extraction.summary + " " + " ".join(extraction.ratio_decidendi)
@@ -377,13 +501,6 @@ def _process_pdf_sync(
     dense_ratio = embedder.embed_query(ratio_text)
     dense_facts = embedder.embed_query(extraction.summary)
     dense_full  = embedder.embed_query(master_text)
-
-    year_raw = meta.get("case_year", "") or ""
-    try:
-        m = re.search(r'\d{4}', str(year_raw))
-        year = int(m.group(0)) if m else 0
-    except Exception:
-        year = 0
 
     point = qm.PointStruct(
         id=point_id,
@@ -396,10 +513,12 @@ def _process_pdf_sync(
             "text_for_bm25":    master_text,
             "text_hash":        text_hash,
             "file_path":        str(pdf_path),
+            "case_title":       case_title,
+            "citation":         citation,
             "summary":          extraction.summary,
-            "ratio_decidendi":  extraction.ratio_decidendi,   # list[str] directly (BUG 3 fix)
+            "ratio_decidendi":  extraction.ratio_decidendi,
             "outcome":          extraction.outcome,
-            "court":            meta.get("court", ""),
+            "court":            court,
             "year":             year,
             "case_number":      meta.get("case_number", ""),
             "case_type":        meta.get("case_type", ""),
@@ -410,8 +529,8 @@ def _process_pdf_sync(
             "statutes_canon":   canon["statutes_canon"],
             "precedents_raw":   canon["precedents_raw"],
             "precedents_canon": canon["precedents_canon"],
-            "provision_roles":  prov_roles,   # {text -> role} (BUG 9 fix)
-            "precedent_roles":  prec_roles,   # {citation -> role} (BUG 9 fix)
+            "provision_roles":  prov_roles,
+            "precedent_roles":  prec_roles,
         },
     )
     return "ok", point
@@ -431,15 +550,17 @@ async def _run_all(
         client = QdrantClient(path=qdrant_path)
         log.info("Using local Qdrant storage at %s", qdrant_path)
     else:
-        api_key = os.environ.get("QDRANT_API_KEY")
-        if not api_key:
+        cloud_url = os.getenv("QDRANT_URL", _CLOUD_URL)
+        api_key   = os.environ.get("QDRANT_API_KEY")
+        is_local  = cloud_url.startswith(("http://localhost", "http://127."))
+        if not api_key and not is_local:
             log.error(
                 "QDRANT_API_KEY not set — cannot connect to cloud Qdrant. "
                 "Check backend/.env contains QDRANT_API_KEY = \"...\"."
             )
             sys.exit(1)
-        client = QdrantClient(url=_CLOUD_URL, api_key=api_key, timeout=60)
-        log.info("Using Qdrant Cloud at %s", _CLOUD_URL)
+        client = QdrantClient(url=cloud_url, api_key=api_key or None, timeout=60)
+        log.info("Using Qdrant at %s", cloud_url)
 
     # format="json" instructs Ollama to constrain output to valid JSON.
     # _parse_ingest_response handles the parsing — no SYSTEM_PROMPT or

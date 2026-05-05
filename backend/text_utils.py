@@ -44,6 +44,8 @@ _FOOTER_SIG_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INLINE_PAGE_RE = re.compile(r'\s*\b(?:page|pg\.?)\s+\d+\s+of\s+\d+\b', re.IGNORECASE)
+
 
 def _is_page_line(line: str) -> bool:
     """Return True if *line* looks like a bare page number / page marker."""
@@ -71,7 +73,19 @@ def strip_page_numbers(text: str) -> str:
     i = 0
     while i < len(lines):
         line = lines[i]
+
+        # Full-line page-marker check must come before inline-token stripping.
+        # Without this, "Case reference Page 11 of 120" would have the page
+        # token stripped to leave "Case reference" which is then kept.
         if not _is_page_line(line):
+            stripped = _INLINE_PAGE_RE.sub('', line).rstrip()
+            if stripped != line and stripped.strip():
+                # Inline "Page N of N" token removed; keep remainder unless it
+                # is itself a page marker (e.g. bare case-header after strip).
+                if not _is_page_line(stripped):
+                    result.append(stripped)
+                i += 1
+                continue
             result.append(line)
             i += 1
             continue
