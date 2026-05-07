@@ -1,90 +1,93 @@
-# NyAI-Lens — Indian Court Judgment Analyser
+# NyAI-Lens
 
-A FastAPI backend + Streamlit frontend for analyzing Indian Supreme Court judgments.
+An AI-powered analysis tool for Indian court judgments(Specialized more for Supreme Court Judgements). Upload a Supreme Court or High Court PDF and instantly get structured metadata, paragraph-level rhetorical classification, legal entity highlighting, conversational Q&A, and similar case search.
+
+---
+
+## Features
+
+### PDF Ingestion & Extraction
+
+Converts a judgment PDF into clean structured text — metadata, numbered paragraphs, and a signature footer — using `pymupdf4llm` with OCR fallback for scanned pages.
+
+![Extract Flow](Flowcharts/Extract.png)
+
+---
+
+### Metadata Extraction
+
+Extracts structured metadata (citation, court, parties, judges, date, jurisdiction) from the judgment header using both regex and LLM extraction, merged with LLM-primary fallback.
+
+**Demo**
+
+![Metadata Demo](Flowcharts/DemoMetadata.png)
+
+---
+
+### Rhetorical Classification
+
+Tags each paragraph with its legal role (Facts, Ratio Decidendi, Arguments, Disposition, etc.) using a streaming LLM pipeline with concurrent paragraph processing.
+
+**Flow**
+
+![Classify Flow](Flowcharts/NewClassify.png)
+
+**Demo**
+
+![Classification Demo](Flowcharts/DemoClassification.png)
+
+---
+
+### Agentic RAG Chat
+
+A multi-step chat system that plans which tools to call (metadata lookup, summary retrieval, dense+BM25 paragraph search), streams the answer token by token, and runs citation and faithfulness checks.
+
+**Flow**
+
+![Chatbot Flow](Flowcharts/NewChatbot.png)
+
+**Demo**
+
+![Chatbot Demo 1](Flowcharts/DemoChatbot1.png)
+![Chatbot Demo 2](Flowcharts/DemoChatbot2.png)
+
+---
+
+### Similar Case Search
+
+Finds the top-5 most legally similar judgments in a pre-indexed Qdrant database using three semantic vectors (ratio, facts, full), NER-based entity overlap (Jaccard on provisions/statutes/precedents), and cross-encoder reranking.
+
+**Flow**
+
+![Similar Flow](Flowcharts/Similar.png)
+
+**Demo**
+
+![Similar Demo 1](Flowcharts/DemoSimilar1.png)
+![Similar Demo 2](Flowcharts/DemoSimilar2.png)
+![Similar Demo 3](Flowcharts/DemoSimilar3.png)
+
+---
+
+### Legal NER Highlighting
+
+Extracts and highlights legal named entities — provisions, statutes, and precedents — using a spaCy transformer model fine-tuned on Indian court documents.
+
+**Demo**
+
+![NER Demo](Flowcharts/DemoNERHighlights.png)
+
+
+---
 
 ## Setup
 
-### 1. Copy environment config
+See [SETUP.md](SETUP.md) for installation, environment configuration, and ingestion instructions.
 
-```bash
-cp backend/.env.example backend/.env
-```
-
-Edit `backend/.env` and fill in your **Qdrant API key** and the Ollama model names you want to use.
-
-### 2. Install Ollama models
-
-Pull each model before starting the server:
-
-```bash
-ollama pull bge-m3          # embedding model (must produce 1024-dim vectors)
-ollama pull llama3.3:70b    # LLM for extraction & RAG
-ollama pull deepseek-r1:7b  # rhetorical classification
-ollama pull translategemma:4b
-```
-
-### 3. Install Python dependencies
-
-```bash
-pip install -r backend/requirements.txt
-pip install -r frontend/requirements.txt
-```
-
-Also install the legal NER spaCy model:
-
-```bash
-pip install https://huggingface.co/opennyaiorg/en_legal_ner_trf/resolve/main/en_legal_ner_trf-any-py3-none-any.whl
-```
-
-### 4. Populate the Qdrant corpus (required for Similar Judgments)
-
-```bash
-# Ingest a folder of PDF judgments into Qdrant Cloud (uses QDRANT_API_KEY from .env)
-python -m backend.ingest --pdf-dir /path/to/judgment_pdfs
-
-# With concurrency and a debug limit:
-python -m backend.ingest --pdf-dir /path/to/judgment_pdfs --workers 4 --limit 10
-
-# Dev / local Qdrant (no auth needed):
-python -m backend.ingest --pdf-dir /path/to/judgment_pdfs --qdrant-path ./qdrant_local
-```
-
-## Running
-
-Start the backend (from the project root):
-
-```bash
-uvicorn backend.main:app --reload
-```
-
-In a separate terminal, start the frontend:
-
-```bash
-streamlit run frontend/app.py
-```
-
-The frontend connects to `http://localhost:8000` by default. Change `BACKEND_URL` at the top of [frontend/app.py](frontend/app.py) if needed.
-
-## API Endpoints
-
-| Method | Path          | Description |
-|--------|---------------|-------------|
-| POST   | `/extract`    | Upload PDF → `{ doc_id, markdown, header, chunks, footer, metadata }` |
-| POST   | `/classify`   | `{ doc_id, indices? }` — streams SSE, one JSON per paragraph |
-| POST   | `/chat`       | `{ doc_id, question, history }` — streams SSE tokens |
-| POST   | `/translate`  | `{ text, language }` — streams SSE tokens |
-| GET    | `/ner`        | `?text=...` → `{ spans: [{text, label}] }` (text capped at 10 K chars) |
-| POST   | `/similar`    | Upload PDF → top-5 similar judgments from Qdrant corpus |
-| GET    | `/debug/footer` | `?doc_id=...` → raw footer extraction data (debugging) |
+---
 
 ## Architecture
 
-```
-frontend/app.py      ← Streamlit UI (upload, view, chat, translate, similar)
-backend/main.py      ← FastAPI server (all endpoints + paragraph parsing)
-backend/ingest.py    ← Batch ingest script (PDFs → Qdrant)
-backend/legal_normalizer.py  ← Canonical entity keys for Jaccard comparison
-backend/text_utils.py        ← Shared text-cleaning helpers
-```
+The backend is a FastAPI server (`backend/main.py`) with six endpoints, using Ollama-hosted LLMs, FAISS + BM25 for per-document retrieval, a cross-encoder reranker, spaCy legal NER, and Qdrant Cloud for the similar-case index. The frontend is a Streamlit app consuming JSON and SSE streams over `httpx`.
 
-> **Note:** `backend/chunker.py` is deprecated — all chunking logic lives in `main.py`.
+For a complete project overview and walkthrough see [Presentation.pptx](Presentation.pptx).
